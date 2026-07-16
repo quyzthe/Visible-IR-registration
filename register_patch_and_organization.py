@@ -54,6 +54,7 @@ import os
 import re
 import csv
 import shutil
+import math
 
 import cv2
 import torch
@@ -121,6 +122,21 @@ CONFIG = dict(
                                             # discarded outright -- recovers correct matches in
                                             # texture-poor regions that LoFTR alone under-scores.
     ),
+    lens_self_calibration=dict(    # OPTIONAL: self-calibrate a radial (lens) distortion coefficient
+                                    # for the thermal camera directly from these same natural-scene
+                                    # correspondences -- no chessboard needed (plane-based self-
+                                    # calibration of radial distortion; see Truong et al. 2017 for the
+                                    # chessboard-based version, adapted here for our data). Only
+                                    # modeled on the thermal side: consumer/prosumer visible cameras
+                                    # (DJI included) typically already correct lens distortion
+                                    # in-camera on the JPEG; thermal sensors generally don't.
+                                    # SAFETY: only adopted if it beats the plain homography on a
+                                    # held-out validation split -- never allowed to reduce accuracy.
+        enabled=True,
+        min_points=120,             # need a reasonably large inlier set before attempting this
+        val_fraction=0.2,           # held-out fraction used to validate before adopting
+        min_improvement_px=0.05,    # must beat the baseline by at least this much RMSE to be adopted
+    ),
     local_refinement=dict(         # optional non-rigid residual correction ON TOP of the affine,
                                     # for the local misalignment a rigid/affine model can't capture
                                     # (the two lenses have different distortion) -- see UAV-TIRVis.
@@ -135,7 +151,7 @@ CONFIG = dict(
     # ---- Step 2b: apply calibrated transform to every pair (color, no LoFTR) ----
     save_warped_thermal=True,
     save_overlay=True,
-    max_pairs_per_run=500,          # None = process everything found; int = only this many NEW pairs this run
+    max_pairs_per_run=20,          # None = process everything found; int = only this many NEW pairs this run
     skip_already_processed=True,   # skip pairs that already have an overlay output on disk
 
     # ---- Step 3: densify -- fill gaps using overlap between NEIGHBORING visible
@@ -148,7 +164,7 @@ CONFIG = dict(
         # ---- 1) detect_features ----
         feature_detector="sift",     # "sift" (default -- what OpenSfM/ODM use by default, better in
                                       # low-texture regions) or "orb" (faster, no GPU/patent concerns)
-        n_features=10000,             # max keypoints per image
+        n_features=4000,             # max keypoints per image
         save_features=True,          # cache to register_results/rgb_features/<idx>.npz -- computed
                                       # ONCE per image EVER (across the whole warped_thermal pool, not
                                       # just this run's targets), reused by every future run
@@ -177,11 +193,15 @@ CONFIG = dict(
         min_track_len=2,             # keep tracks observed in at least this many images
 
         # ---- 5) fill ----
+        mask_dilate_px=3,            # grow each source's valid-region mask by this many px before
+                                      # compositing -- warpPerspective+INTER_NEAREST leaves ragged/gappy
+                                      # mask edges, and two independently-fit homographies never agree
+                                      # on the boundary to the pixel; a small overlap beats a real gap
         feather_px=15,               # soft-blend width (px, native resolution) at the boundary where
                                       # a new source fills in -- reduces visible seams between sources
                                       # captured at different times/positions. 0 = hard cutoff, no blend.
 
-        max_pairs_per_run=500,       # separate cap -- this stage does its own feature matching too
+        max_pairs_per_run=100,       # separate cap -- this stage does its own feature matching too
         skip_already_processed=True,
     ),
 )
@@ -468,14 +488,83 @@ def load_gray(path):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {path}")
-    return img
+    return _maybe_undistort(img, path)
 
 
 def load_color(path):
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {path}")
-    return img
+    return _maybe_undistort(img, path)
+
+
+# =====================================================================
+# DJI FACTORY LENS CALIBRATION (XMP DewarpData) -- Truong et al. (ICCVW
+# 2017, "Registration of RGB and thermal point clouds generated by SfM")
+# calibrate a chessboard by hand to get each camera's intrinsics + Brown-
+# Conrady distortion, then undistort before registering. DJI's mapping-
+# oriented cameras (P4 Multispectral, Mavic 3M, P4 RTK, and possibly the
+# M4T's own cameras) embed that exact factory calibration in every photo's
+# XMP "DewarpData" field -- no chessboard needed, it's already in the file.
+# Undistorting BEFORE matching removes lens distortion as a source of
+# error entirely, instead of the TPS step trying to absorb it empirically
+# after the fact. Applied globally through load_gray/load_color (a single
+# switch, not threaded through every call site) so calibration and apply
+# always see identical geometry -- if that were inconsistent between the
+# two stages it would silently corrupt the fit, which is exactly what
+# "never reduce accuracy" means to guard against here.
+# =====================================================================
+
+_DEWARP_ENABLED = False
+_DEWARP_CACHE = {}
+
+
+def parse_dji_dewarp(path):
+    """Read DJI XMP DewarpData: 'fx,fy,cx,cy,k1,k2,p1,p2,k3' (often prefixed
+    with a version/date and a semicolon). Returns a dict or None if absent/
+    unparseable -- absence is normal (e.g. many thermal sensors don't have
+    this), not an error."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(131072)  # DewarpData lives in the XMP block near the file start
+        text = head.decode("latin-1", errors="ignore")
+        m = (re.search(r'DewarpData[>="]+([^"<]+)', text)
+             or re.search(r'drone-dji:DewarpData="([^"]+)"', text))
+        if not m:
+            return None
+        raw = m.group(1).strip()
+        nums_str = raw.split(";")[-1]
+        vals = [float(x) for x in nums_str.split(",") if x.strip()]
+        if len(vals) != 9:
+            return None
+        fx, fy, cx, cy, k1, k2, p1, p2, k3 = vals
+        return dict(fx=fx, fy=fy, cx=cx, cy=cy, k1=k1, k2=k2, p1=p1, p2=p2, k3=k3)
+    except Exception:
+        return None
+
+
+def _get_dewarp(path):
+    if path not in _DEWARP_CACHE:
+        _DEWARP_CACHE[path] = parse_dji_dewarp(path)
+    return _DEWARP_CACHE[path]
+
+
+def undistort_dji(img, dw):
+    h, w = img.shape[:2]
+    cx_abs = w / 2.0 + dw["cx"]
+    cy_abs = h / 2.0 + dw["cy"]
+    K = np.array([[dw["fx"], 0, cx_abs], [0, dw["fy"], cy_abs], [0, 0, 1]], dtype=np.float64)
+    D = np.array([dw["k1"], dw["k2"], dw["p1"], dw["p2"], dw["k3"]], dtype=np.float64)
+    return cv2.undistort(img, K, D)
+
+
+def _maybe_undistort(img, path):
+    if not _DEWARP_ENABLED:
+        return img
+    dw = _get_dewarp(path)
+    if dw is None:
+        return img
+    return undistort_dji(img, dw)
 
 
 def preprocess(gray, size, clip, tile):
@@ -661,6 +750,98 @@ def fit_tps_correction(mkpts0_inlier, mkpts1_inlier, M, work_size, cfg):
 
 
 # =====================================================================
+# LENS SELF-CALIBRATION: radial distortion coefficient for the thermal
+# camera, estimated directly from the pooled natural-scene correspondences
+# (no chessboard needed) -- "plane-based self-calibration of radial
+# distortion" (e.g. Thirthala & Pollefeys 2005; Fitzgibbon 2001's one-
+# parameter division model). Modeled on the thermal side only: consumer/
+# prosumer visible cameras (DJI included) typically apply lens correction
+# in-camera to the JPEG already, thermal sensors generally don't.
+# =====================================================================
+
+def undistort_division_model(pts, center, k, scale):
+    """Distorted pixel coords -> undistorted. One-parameter division model
+    (closed form, no iteration): x_u = c + (x_d-c) / (1 + k*(r_d/scale)^2).
+    center = distortion center (assumed = image center, the standard
+    simplifying assumption when no chessboard is available). scale = a
+    normalizing radius (half image diagonal) so k stays O(1) regardless of
+    resolution."""
+    d = pts - center
+    r2 = (d[:, 0] ** 2 + d[:, 1] ** 2) / (scale ** 2)
+    factor = 1.0 / (1.0 + k * r2)
+    return center + d * factor[:, None]
+
+
+def distort_division_model_forward(pts, center, k, scale):
+    """Undistorted -> distorted, first-order approximation of the division
+    model's inverse (the exact inverse has no closed form). Accurate for
+    the mild distortion typical of real camera lenses; any small residual
+    approximation error gets absorbed by the TPS local-refinement pass
+    that runs after this."""
+    d = pts - center
+    r2 = (d[:, 0] ** 2 + d[:, 1] ** 2) / (scale ** 2)
+    factor = 1.0 - k * r2
+    return center + d * factor[:, None]
+
+
+def _homog_params_to_H(params):
+    h = params[:8]
+    return np.array([[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1.0]])
+
+
+def _H_to_homog_params(H3x3):
+    H = H3x3 / H3x3[2, 2]
+    return np.array([H[0, 0], H[0, 1], H[0, 2], H[1, 0], H[1, 1], H[1, 2], H[2, 0], H[2, 1]])
+
+
+def fit_homography_with_distortion(src_pts, dst_pts, H_init, center, scale):
+    """Jointly refine a homography AND a single radial-distortion
+    coefficient k for the source (thermal) camera, minimizing reprojection
+    error with a robust (soft_l1) loss."""
+    from scipy.optimize import least_squares
+
+    def residuals(params):
+        H = _homog_params_to_H(params[:8])
+        k = params[8]
+        undist = undistort_division_model(src_pts, center, k, scale)
+        pred = apply_homogeneous(H, undist)
+        return (pred - dst_pts).ravel()
+
+    params0 = np.concatenate([_H_to_homog_params(to_3x3(H_init)), [0.0]])
+    result = least_squares(residuals, params0, method="trf", loss="soft_l1", f_scale=2.0, max_nfev=3000)
+    H_fit = _homog_params_to_H(result.x[:8])
+    k_fit = float(result.x[8])
+    return H_fit, k_fit
+
+
+def _reprojection_rmse(H, k, center, scale, src_pts, dst_pts):
+    pts = undistort_division_model(src_pts, center, k, scale) if k is not None else src_pts
+    pred = apply_homogeneous(to_3x3(H), pts)
+    return float(np.sqrt(np.mean(np.sum((pred - dst_pts) ** 2, axis=1))))
+
+
+def build_undistort_map(work_size, native_shape, center_work, k, scale_work, grid_step=20):
+    """Native-resolution (dst=undistorted thermal, src=original distorted
+    thermal) remap for the self-calibrated radial distortion, in the
+    THERMAL image's own coordinate frame (independent of the visible frame
+    entirely) -- applied as a pre-pass before the usual warpPerspective(H)."""
+    W, H = work_size
+    Hn, Wn = native_shape[:2]
+    xs = np.unique(np.append(np.arange(0, W, grid_step), W - 1))
+    ys = np.unique(np.append(np.arange(0, H, grid_step), H - 1))
+    gx, gy = np.meshgrid(xs, ys)
+    grid_pts = np.stack([gx.ravel(), gy.ravel()], axis=1).astype(np.float64)
+    dist_pts = distort_division_model_forward(grid_pts, center_work, k, scale_work)
+
+    map_x_work = cv2.resize(dist_pts[:, 0].reshape(gy.shape).astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
+    map_y_work = cv2.resize(dist_pts[:, 1].reshape(gy.shape).astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
+    sx, sy = Wn / W, Hn / H
+    map_x_native = cv2.resize(map_x_work, (Wn, Hn), interpolation=cv2.INTER_LINEAR) * sx
+    map_y_native = cv2.resize(map_y_work, (Wn, Hn), interpolation=cv2.INTER_LINEAR) * sy
+    return map_x_native, map_y_native
+
+
+# =====================================================================
 # STEP 2a: CALIBRATE -- fit ONE shared transform from a pooled sample,
 # with guided inlier recovery + optional local TPS refinement
 # =====================================================================
@@ -679,13 +860,16 @@ def calibrate(cfg):
             print(f"[WARN] existing calibration was fit with transform_model='{saved_model}', "
                   f"but config now says '{cfg['transform_model']}'. Using the SAVED calibration -- "
                   "set calibration.recalibrate=True to refit with the new model.")
+        k_thermal = float(data["k_thermal"]) if "k_thermal" in data else 0.0
         print(f"Using existing calibration: {calib_path} "
               f"(model={saved_model}, from {int(data['n_sample_pairs'])} pairs, "
               f"{int(data['n_inliers'])}/{int(data['n_pooled_matches'])} inliers, "
-              f"RMSE={float(data['rmse_px']):.2f}px{' + local TPS' if has_tps else ''}). "
+              f"RMSE={float(data['rmse_px']):.2f}px{' + local TPS' if has_tps else ''}"
+              f"{f' + lens k={k_thermal:.4f}' if k_thermal != 0.0 else ''}). "
               "Set calibration.recalibrate=True to redo it.")
         tps = (data["map_x"], data["map_y"]) if has_tps else None
-        return data["M_work"].astype(np.float64), tuple(int(v) for v in data["work_size"]), tps
+        dist = (k_thermal, data["dist_center"], float(data["dist_scale"])) if "dist_center" in data else None
+        return data["M_work"].astype(np.float64), tuple(int(v) for v in data["work_size"]), tps, dist
 
     n = min(cfg["calibration"]["sample_size"], len(pairs))
     sample_pos = sorted(set(np.linspace(0, len(pairs) - 1, n).astype(int).tolist()))
@@ -783,11 +967,52 @@ def calibrate(cfg):
     rmse = float(np.sqrt(np.mean(_reprojection_error(M, inlier_pts1, inlier_pts0) ** 2)))
     print(f"Reprojection RMSE (inliers): {rmse:.2f} px (work-resolution {cfg['work_size']})")
 
+    # ---- lens self-calibration: try a radial distortion correction for the
+    # thermal camera, ONLY adopted if it demonstrably beats the plain model
+    # on a held-out split -- never allowed to make accuracy worse ----
+    lens = cfg.get("lens_self_calibration", {"enabled": False})
+    k_thermal = 0.0
+    W_, H_ = cfg["work_size"]
+    dist_center = np.array([W_ / 2.0, H_ / 2.0])
+    dist_scale = math.hypot(W_, H_) / 2.0
+    if lens.get("enabled", False) and len(inlier_pts0) >= lens.get("min_points", 120):
+        rng = np.random.default_rng(0)
+        n = len(inlier_pts0)
+        perm = rng.permutation(n)
+        n_val = max(20, int(n * lens.get("val_fraction", 0.2)))
+        val_idx, train_idx = perm[:n_val], perm[n_val:]
+
+        H_train, mask_train = estimate_transform_robust(inlier_pts1[train_idx], inlier_pts0[train_idx], cfg)
+        if H_train is not None:
+            rmse_baseline = _reprojection_rmse(H_train, None, dist_center, dist_scale,
+                                                inlier_pts1[val_idx], inlier_pts0[val_idx])
+            H_dist, k_cand = fit_homography_with_distortion(
+                inlier_pts1[train_idx], inlier_pts0[train_idx], H_train, dist_center, dist_scale
+            )
+            rmse_distortion = _reprojection_rmse(H_dist, k_cand, dist_center, dist_scale,
+                                                  inlier_pts1[val_idx], inlier_pts0[val_idx])
+            print(f"Lens self-calibration: held-out RMSE without={rmse_baseline:.2f}px, "
+                  f"with radial distortion (k={k_cand:.4f})={rmse_distortion:.2f}px")
+            if rmse_distortion < rmse_baseline - lens.get("min_improvement_px", 0.05):
+                # refit on ALL inliers (not just the train split) for the final production model
+                M, k_thermal = fit_homography_with_distortion(inlier_pts1, inlier_pts0, M, dist_center, dist_scale)
+                rmse = _reprojection_rmse(M, k_thermal, dist_center, dist_scale, inlier_pts1, inlier_pts0)
+                print(f"  -> adopted (k={k_thermal:.4f}); reprojection RMSE now {rmse:.2f}px "
+                      "(this is the base transform for TPS + apply)")
+            else:
+                print("  -> not adopted (no reliable improvement over held-out baseline)")
+
+    # correspondences used for TPS from here on are pre-undistorted if a
+    # distortion coefficient was adopted, so TPS fits the RESIDUAL on top of
+    # the (now better) homography+distortion base, not on top of raw thermal
+    tps_src_pts = (undistort_division_model(inlier_pts1, dist_center, k_thermal, dist_scale)
+                   if k_thermal != 0.0 else inlier_pts1)
+
     map_x = map_y = None
     has_tps = False
     lr = cfg["local_refinement"]
     if lr["enabled"] and len(inlier_pts0) >= lr["min_points"]:
-        tps = fit_tps_correction(inlier_pts0, inlier_pts1, M, cfg["work_size"], cfg)
+        tps = fit_tps_correction(inlier_pts0, tps_src_pts, M, cfg["work_size"], cfg)
         if tps is not None:
             map_x, map_y = tps
             has_tps = True
@@ -802,12 +1027,13 @@ def calibrate(cfg):
         calib_path,
         M_work=M, work_size=np.array(cfg["work_size"]), transform_model=cfg["transform_model"],
         n_sample_pairs=len(sample), n_pooled_matches=len(mkpts0_final), n_inliers=inliers,
-        rmse_px=rmse, has_tps=has_tps,
+        rmse_px=rmse, has_tps=has_tps, k_thermal=k_thermal,
+        dist_center=dist_center, dist_scale=dist_scale,
         map_x=map_x if has_tps else np.zeros((1, 1), dtype=np.float32),
         map_y=map_y if has_tps else np.zeros((1, 1), dtype=np.float32),
     )
     print(f"Saved calibration: {calib_path}")
-    return M, cfg["work_size"], ((map_x, map_y) if has_tps else None)
+    return M, cfg["work_size"], ((map_x, map_y) if has_tps else None), (k_thermal, dist_center, dist_scale)
 
 
 # =====================================================================
@@ -816,7 +1042,7 @@ def calibrate(cfg):
 # no per-pair fit.
 # =====================================================================
 
-def apply_calibration(cfg, M_work, work_size, tps=None):
+def apply_calibration(cfg, M_work, work_size, tps=None, distortion=None):
     out_dirs = {
         "warped_thermal": os.path.join(cfg["register_results_dir"], "warped_thermal"),
         "overlays": os.path.join(cfg["register_results_dir"], "overlays"),
@@ -845,12 +1071,24 @@ def apply_calibration(cfg, M_work, work_size, tps=None):
           f"applying to {len(run_now)} this session"
           + (f" | {remaining_after} will remain for next run" if remaining_after > 0 else ""))
 
+    k_thermal, dist_center_work, dist_scale_work = distortion if distortion is not None else (0.0, None, None)
+
     n_ok, n_err = 0, 0
     for idx, vpath, tpath in run_now:
         try:
             visible_color = load_color(vpath)
             thermal_color = load_color(tpath)
             out_size = (visible_color.shape[1], visible_color.shape[0])
+
+            if k_thermal != 0.0:
+                # self-calibrated lens correction, in thermal's own native frame,
+                # BEFORE the usual homography warp -- everything below is unchanged
+                map_x_u, map_y_u = build_undistort_map(
+                    work_size, thermal_color.shape, dist_center_work, k_thermal, dist_scale_work
+                )
+                thermal_color = cv2.remap(thermal_color, map_x_u, map_y_u,
+                                           interpolation=cv2.INTER_LINEAR,
+                                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
             M_full = full_res_matrix(M_work, thermal_color.shape, visible_color.shape, work_size)
             thermal_warped = cv2.warpPerspective(thermal_color, M_full, out_size)
@@ -1092,13 +1330,95 @@ def match_pair(pts_a, descs_a, pts_b, descs_b, norm_type, cfg):
     return H, int(mask.sum()), inlier_pairs
 
 
-def _feather_composite(base, base_filled, add_bgr, add_alpha, feather_px):
+def _match_status_path(cfg):
+    return os.path.join(cfg["register_results_dir"], "rgb_matches.csv")
+
+
+def _inlier_matches_path(cfg):
+    return os.path.join(cfg["register_results_dir"], "rgb_inlier_matches.csv")
+
+
+def load_pair_status(cfg):
+    """(a,b) -> (verified: bool, inliers: int) for every candidate pair EVER
+    attempted across all past runs -- lets later runs skip pairs already
+    tried (whether they succeeded or failed) instead of redoing them."""
+    path = _match_status_path(cfg)
+    status = {}
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                status[(row["image_a"], row["image_b"])] = (row["verified"] == "1", int(row["inliers"]))
+    return status
+
+
+def append_pair_status(cfg, rows):
+    path = _match_status_path(cfg)
+    is_new = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["image_a", "image_b", "verified", "inliers"])
+        for a, b, v, inl in rows:
+            writer.writerow([a, b, int(v), inl])
+
+
+def append_inlier_matches(cfg, a, b, inlier_pairs):
+    """Raw verified correspondences for ONE pair -- the ground truth that
+    tracks are rebuilt from every run. Appended once, read many times."""
+    path = _inlier_matches_path(cfg)
+    is_new = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["image_a", "image_b", "kp_a", "kp_b"])
+        for i, j in inlier_pairs:
+            writer.writerow([a, b, i, j])
+
+
+def load_all_inlier_matches(cfg):
+    """Every verified correspondence ever recorded, across all past runs --
+    this is the full history the global track graph gets rebuilt from."""
+    path = _inlier_matches_path(cfg)
+    rows = []
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                rows.append((row["image_a"], row["image_b"], int(row["kp_a"]), int(row["kp_b"])))
+    return rows
+
+
+def export_tracks_csv(cfg, tracks):
+    """ODM/OpenSfM-style tracks.csv: track_id,image,feature_id -- one row
+    per observation, so "which images contain this feature" is a single
+    group-by away. Regenerated fresh each run from the full match history
+    (cheap: union-find over the whole history is milliseconds even at
+    hundreds of thousands of edges), so it's always complete and correct,
+    never a stale incremental patch."""
+    path = os.path.join(cfg["register_results_dir"], "tracks.csv")
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["track_id", "image", "feature_id"])
+        for tid, obs in enumerate(tracks):
+            for im, kp in obs:
+                writer.writerow([tid, im, kp])
+    return path
+
+
+def _feather_composite(base, base_filled, add_bgr, add_alpha, feather_px, dilate_px):
     """Composite add_bgr into base wherever add_alpha is valid and base isn't
-    filled yet, with a soft-edged blend (distance-transform feathering) at
-    the boundary instead of a hard cutoff -- reduces visible seams between
-    sources captured at different times/positions, the cheap panorama-
-    stitching trick (full multi-band blending would help more but is a much
-    bigger lift)."""
+    filled yet. Two fixes for the visible gaps between adjacent patches:
+    - dilate_px: the warped alpha mask is grown by a few pixels first, since
+      warpPerspective + INTER_NEAREST on a binary mask leaves ragged/gappy
+      edges, and two independently-fit homographies never agree on the
+      boundary to the pixel -- a small overlap is safer than a real gap.
+    - feather_px: soft-edged blend (distance-transform) at the boundary
+      instead of a hard cutoff, so the (now slightly overlapping) seam
+      between two different capture times isn't a visible hard line.
+    """
+    if dilate_px > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1))
+        add_alpha = cv2.dilate(add_alpha, kernel)
+
     new_only = (add_alpha > 0) & (~base_filled)
     if not new_only.any():
         return base, base_filled
@@ -1160,40 +1480,50 @@ def densify_with_neighbors(cfg):
     bow_vectors = compute_bow_vectors(feats, vocab)
     candidates_by_idx = bow_top_candidates(bow_vectors, dz["top_m_candidates"])
 
-    # ---- 3) match_features on candidate pairs (verified via RANSAC) ----
-    print("3) match_features: verifying BoW-selected candidate pairs...")
+    # ---- 3) match_features: only pairs never attempted before get matched;
+    # everything (success AND failure) is recorded so it's never retried ----
+    print("3) match_features: matching new candidate pairs (skipping ones already attempted)...")
+    pair_status = load_pair_status(cfg)
     involved = set(run_now)
     for idx in run_now:
         involved.update(candidates_by_idx.get(idx, []))
 
-    uf = UnionFind()
-    pair_cache = {}
-    computed_pairs = set()
+    status_rows, n_new_verified = [], 0
     for idx in involved:
         for nidx in candidates_by_idx.get(idx, []):
             key = (min(idx, nidx), max(idx, nidx))
-            if key in computed_pairs:
+            if key in pair_status:
                 continue
-            computed_pairs.add(key)
             a, b = key
             result = match_pair(feats[a][0], feats[a][1], feats[b][0], feats[b][1], norm_type, cfg)
             if result is None:
-                pair_cache[key] = (None, 0)
+                pair_status[key] = (False, 0)
+                status_rows.append((a, b, False, 0))
                 continue
             H, inliers, inlier_pairs = result
-            pair_cache[key] = (H, inliers)
-            for i, j in inlier_pairs:
-                uf.union((a, i), (b, j))
-    n_verified = sum(1 for v in pair_cache.values() if v[0] is not None)
-    print(f"   {n_verified}/{len(computed_pairs)} candidate pairs verified (passed RANSAC)")
+            pair_status[key] = (True, inliers)
+            status_rows.append((a, b, True, inliers))
+            append_inlier_matches(cfg, a, b, inlier_pairs)
+            n_new_verified += 1
+    if status_rows:
+        append_pair_status(cfg, status_rows)
+    n_verified_total = sum(1 for v, _ in pair_status.values() if v)
+    print(f"   {len(status_rows)} new pairs attempted this run ({n_new_verified} verified) | "
+          f"{n_verified_total} verified pairs total (all runs, in {_match_status_path(cfg)})")
 
-    # ---- 4) create_tracks ----
+    # ---- 4) create_tracks from the FULL accumulated match history, not just
+    # this run -- this is what makes it genuinely global: an image processed
+    # today can bridge to one processed weeks ago via a chain of past matches ----
+    uf = UnionFind()
+    for a, b, kp_a, kp_b in load_all_inlier_matches(cfg):
+        uf.union((a, kp_a), (b, kp_b))
     groups = {}
     for node in list(uf.parent):
         groups.setdefault(uf.find(node), []).append(node)
     tracks = [obs for obs in groups.values() if len({im for im, _ in obs}) >= dz["min_track_len"]]
     n_multi = sum(1 for t in tracks if len({im for im, _ in t}) >= 3)
-    print(f"4) create_tracks: {len(tracks)} tracks ({n_multi} seen in 3+ images)")
+    tracks_path = export_tracks_csv(cfg, tracks)
+    print(f"4) create_tracks: {len(tracks)} tracks ({n_multi} seen in 3+ images), exported to {tracks_path}")
 
     tracks_by_image = {}
     for tid, obs in enumerate(tracks):
@@ -1205,22 +1535,25 @@ def densify_with_neighbors(cfg):
         tb_by_tid = {tid: kp for kp, tid in tracks_by_image.get(b, {}).items()}
         src, dst = [], []
         for kp_a, tid in ta.items():
-            if tid in tb_by_tid:
+            if tid in tb_by_tid and a in feats and b in feats:
                 src.append(feats[a][0][kp_a])
                 dst.append(feats[b][0][tb_by_tid[tid]])
         return np.array(src), np.array(dst)
 
     def homography_via_tracks(a, b):
+        """Refit directly from ALL track-shared correspondences between a and
+        b -- this already includes every point from their direct pairwise
+        match (that's what created the track in the first place), plus any
+        extra points bridged in through other images' tracks. If that still
+        doesn't reach min_matches, there's nothing more reliable to fall
+        back to, so it's correctly declined."""
         src, dst = shared_track_correspondences(a, b)
-        if len(src) >= dz["min_matches"]:
-            H, mask = estimate_homography_robust(src, dst, dz["ransac_thresh"], dz["ransac_confidence"])
-            if H is not None:
-                return H, int(mask.sum())
-        key = (min(a, b), max(a, b))
-        H, inl = pair_cache.get(key, (None, 0))
+        if len(src) < dz["min_matches"]:
+            return None, 0
+        H, mask = estimate_homography_robust(src, dst, dz["ransac_thresh"], dz["ransac_confidence"])
         if H is None:
             return None, 0
-        return (H if a == key[0] else np.linalg.inv(H)), inl
+        return H, int(mask.sum())
 
     # ---- 5) fill each target from every track-reachable image ----
     print("5) filling targets from every track-reachable image...")
@@ -1260,7 +1593,9 @@ def densify_with_neighbors(cfg):
                 warped_bgr = cv2.warpPerspective(n_bgr, H_full, out_size)
                 warped_alpha = cv2.warpPerspective(n_alpha, H_full, out_size, flags=cv2.INTER_NEAREST, borderValue=0)
 
-                dense, filled = _feather_composite(dense, filled, warped_bgr, warped_alpha, dz["feather_px"])
+                dense, filled = _feather_composite(
+                    dense, filled, warped_bgr, warped_alpha, dz["feather_px"], dz["mask_dilate_px"]
+                )
                 n_sources += 1
 
             final_coverage = float(filled.mean())
@@ -1287,10 +1622,10 @@ def main(cfg=CONFIG):
         return
 
     print("\n=== STEP 2a: calibrate (runs once, reused after) ===")
-    M_work, work_size, tps = calibrate(cfg)
+    M_work, work_size, tps, distortion = calibrate(cfg)
 
     print("\n=== STEP 2b: apply calibrated transform (color, no LoFTR) ===")
-    apply_calibration(cfg, M_work, work_size, tps)
+    apply_calibration(cfg, M_work, work_size, tps, distortion)
 
     print("\n=== STEP 3: densify using RGB-RGB neighbor overlap ===")
     densify_with_neighbors(cfg)
