@@ -54,7 +54,6 @@ import os
 import re
 import csv
 import shutil
-import math
 
 import cv2
 import torch
@@ -78,7 +77,7 @@ CONFIG = dict(
     thermal_dir=r"E:\drone_090426\Raw_images\DCIM_1\DJI_202604090901_001_zoneseuils1\thermal",
     register_results_dir=r"E:\drone_090426\Raw_images\DCIM_1\DJI_202604090901_001_zoneseuils1\register_results",
     copy_mode="copy",              # "copy" (safe, keeps originals) or "move"
-    fresh_start=True,             # True = delete+recreate visible_dir, thermal_dir, and
+    fresh_start=False,             # True = delete+recreate visible_dir, thermal_dir, and
                                     # register_results_dir before doing anything else -- a clean
                                     # slate instead of manually deleting those folders yourself.
                                     # Only affects the run it's True for; set back to False afterwards
@@ -145,33 +144,42 @@ CONFIG = dict(
     # into the target frame via the visible(neighbor)->visible(target) homography.
     densify=dict(
         enabled=True,
-        use_gps=True,                # prefer real ground-distance (EXIF GPS) candidate selection
-        neighbor_radius_m=20.0,      # candidate PAIRS to actually match are chosen within this ground
-                                      # distance (meters) of each other -- like OpenSfM's GPS-neighbor
-                                      # preselection. This only decides which pairs get MATCHED; the
-                                      # final set of images used to fill a target comes from TRACKS
-                                      # (below), which can reach further via bridging through a third
-                                      # image, so this doesn't need to be huge. Tune to roughly your
-                                      # flight LINE spacing (side-lap), not just along-track spacing.
-        max_candidates_per_image=12, # cap candidate pairs per image to bound match cost (closest-first)
-        neighbor_window=3,           # FALLBACK ONLY: index-proximity candidates, used for images with
-                                      # no usable GPS EXIF (or if scipy.spatial is unavailable)
 
         # ---- 1) detect_features ----
         feature_detector="sift",     # "sift" (default -- what OpenSfM/ODM use by default, better in
-                                      # low-texture regions) or "orb" (faster, no patent/GPU concerns)
-        n_features=4000,             # max keypoints per image
+                                      # low-texture regions) or "orb" (faster, no GPU/patent concerns)
+        n_features=10000,             # max keypoints per image
         save_features=True,          # cache to register_results/rgb_features/<idx>.npz -- computed
-                                      # ONCE per image ever, reused across every future run
+                                      # ONCE per image EVER (across the whole warped_thermal pool, not
+                                      # just this run's targets), reused by every future run
 
-        # ---- 2) match_features ----
+        # ---- 2) GLOBAL candidate selection via Bag-of-Visual-Words retrieval ----
+        # (COLMAP/ORB-SLAM/OpenSfM-style "vocabulary tree" match-pair selection --
+        # replaces GPS/index proximity entirely; a candidate pair is chosen by
+        # VISUAL similarity across the WHOLE image pool, not local position)
+        n_words=750,                 # vocabulary size (visual words) -- a single-mission dataset with
+                                      # fairly homogeneous terrain doesn't need a huge vocabulary
+        vocab_sample_descriptors=200000,  # cap on descriptors sampled to build the vocabulary (kmeans)
+        rebuild_vocabulary=False,    # True = rebuild register_results/bow_vocabulary.npz from scratch
+        top_m_candidates=15,         # per image, how many of the most visually-similar OTHER images
+                                      # become match candidates. A bad candidate (visually similar but
+                                      # not actually overlapping, e.g. repeated vegetation) just fails
+                                      # RANSAC verification below and gets dropped -- costs a little
+                                      # compute, not correctness.
+
+        # ---- 3) match_features ----
         match_ratio=0.75,            # Lowe's ratio test threshold
         ransac_thresh=3.0,
         ransac_confidence=0.999,
         min_matches=15,
 
-        # ---- 3) create_tracks ----
+        # ---- 4) create_tracks ----
         min_track_len=2,             # keep tracks observed in at least this many images
+
+        # ---- 5) fill ----
+        feather_px=15,               # soft-blend width (px, native resolution) at the boundary where
+                                      # a new source fills in -- reduces visible seams between sources
+                                      # captured at different times/positions. 0 = hard cutoff, no blend.
 
         max_pairs_per_run=500,       # separate cap -- this stage does its own feature matching too
         skip_already_processed=True,
@@ -885,86 +893,107 @@ def apply_calibration(cfg, M_work, work_size, tps=None):
     print(f"\nThis run: {n_ok} ok, {n_err} error, {len(run_now)} total")
     return run_now
 
-
-
 # =====================================================================
-# GPS-BASED SPATIAL CANDIDATE SELECTION (for choosing which pairs to match --
-# mirrors OpenSfM/ODM using GPS-neighbor preselection instead of all-pairs)
+# GLOBAL CANDIDATE SELECTION: Bag-of-Visual-Words retrieval
+# ("vocabulary tree" match-pair selection, as used in COLMAP/ORB-SLAM/
+# OpenSfM's no-GPS fallback -- see e.g. Schonberger et al., or the UAV-
+# specific "Leveraging vocabulary tree for simultaneous match pair
+# selection..." ISPRS 2022). Every image's descriptors are quantized
+# against a small shared vocabulary into ONE compact TF-IDF histogram;
+# candidate pairs are just the images with the closest histograms --
+# this is a GLOBAL search over every image, not restricted to a local
+# GPS/index neighborhood, which is exactly what was failing before.
 # =====================================================================
 
-def get_gps_latlon(path):
-    """(lat, lon) in decimal degrees from EXIF GPS tags, or None if unavailable
-    (no GPS lock, tags stripped, etc.)."""
-    try:
-        with Image.open(path) as im:
-            exif = im.getexif()
-            gps_ifd = exif.get_ifd(0x8825)
-        if not gps_ifd:
-            return None
+def build_or_load_vocabulary(cfg, feats_by_idx):
+    dz = cfg["densify"]
+    vocab_path = os.path.join(cfg["register_results_dir"], "bow_vocabulary.npz")
+    if os.path.exists(vocab_path) and not dz.get("rebuild_vocabulary", False):
+        return np.load(vocab_path)["centers"]
 
-        def dms_to_deg(dms, ref):
-            d, m, s = (float(x) for x in dms)
-            val = d + m / 60.0 + s / 3600.0
-            return -val if ref in ("S", "W") else val
+    rng = np.random.default_rng(0)
+    idxs = list(feats_by_idx.keys())
+    rng.shuffle(idxs)
+    chunks, total = [], 0
+    for idx in idxs:
+        d = feats_by_idx[idx][1]
+        if len(d):
+            chunks.append(d)
+            total += len(d)
+        if total >= dz["vocab_sample_descriptors"]:
+            break
+    all_descs = np.concatenate(chunks, axis=0).astype(np.float32)
+    if len(all_descs) > dz["vocab_sample_descriptors"]:
+        sel = rng.choice(len(all_descs), dz["vocab_sample_descriptors"], replace=False)
+        all_descs = all_descs[sel]
 
-        lat = dms_to_deg(gps_ifd[2], gps_ifd[1])
-        lon = dms_to_deg(gps_ifd[4], gps_ifd[3])
-        return lat, lon
-    except Exception:
-        return None
-
-
-def build_spatial_index(pairs):
-    """idx -> (x_m, y_m) in local flat-earth meters (equirectangular, centered
-    on the dataset's mean position -- fine for a single-mission survey area).
-    Returns (xy_by_idx, idx_without_gps)."""
-    latlon = {}
-    no_gps = []
-    for idx, vpath, _ in pairs:
-        ll = get_gps_latlon(vpath)
-        if ll is None:
-            no_gps.append(idx)
-        else:
-            latlon[idx] = ll
-
-    if not latlon:
-        return {}, [idx for idx, _, _ in pairs]
-
-    lat0 = sum(v[0] for v in latlon.values()) / len(latlon)
-    lon0 = sum(v[1] for v in latlon.values()) / len(latlon)
-    R = 6371000.0
-    xy = {}
-    for idx, (lat, lon) in latlon.items():
-        x = math.radians(lon - lon0) * math.cos(math.radians(lat0)) * R
-        y = math.radians(lat - lat0) * R
-        xy[idx] = (x, y)
-    return xy, no_gps
+    n_words = min(dz["n_words"], max(2, len(all_descs) // 10))
+    print(f"Building BoW vocabulary: {n_words} words from {len(all_descs):,} sampled descriptors...")
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 20, 1e-4)
+    _, _, centers = cv2.kmeans(all_descs, n_words, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+    np.savez(vocab_path, centers=centers)
+    return centers
 
 
-def _index_window_neighbors(idx, have_warped, window):
-    out = []
-    for off in range(1, window + 1):
-        for nidx in (f"{int(idx) - off:04d}", f"{int(idx) + off:04d}"):
-            if nidx in have_warped:
-                out.append(nidx)
+def compute_bow_vectors(feats_by_idx, vocab):
+    """TF-IDF weighted, L2-normalized BoW histogram per image. Pairwise
+    cosine similarity is then just the dot product of these vectors."""
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    idxs = list(feats_by_idx.keys())
+    n_words = len(vocab)
+
+    raw = {}
+    for idx in idxs:
+        descs = feats_by_idx[idx][1]
+        hist = np.zeros(n_words, dtype=np.float32)
+        if len(descs):
+            for m in matcher.match(descs.astype(np.float32), vocab):
+                hist[m.trainIdx] += 1
+        raw[idx] = hist
+
+    doc_freq = np.zeros(n_words, dtype=np.float64)
+    for idx in idxs:
+        doc_freq += (raw[idx] > 0)
+    idf = np.log((len(idxs) + 1.0) / (doc_freq + 1.0))
+
+    vectors = {}
+    for idx in idxs:
+        v = raw[idx] * idf
+        norm = np.linalg.norm(v)
+        vectors[idx] = (v / norm) if norm > 0 else v
+    return vectors
+
+
+def bow_top_candidates(vectors, top_m):
+    """idx -> list of the top_m most visually-similar OTHER images
+    (cosine similarity via dot product, vectors are already L2-normalized)."""
+    idxs = list(vectors.keys())
+    mat = np.stack([vectors[i] for i in idxs])  # (N, n_words)
+    sims = mat @ mat.T
+    np.fill_diagonal(sims, -1.0)
+    out = {}
+    for row, idx in enumerate(idxs):
+        order = np.argsort(sims[row])[::-1][:top_m]
+        out[idx] = [idxs[o] for o in order if sims[row, o] > 0]
     return out
 
 
 # =====================================================================
 # STEP 3: DENSIFY -- ODM/OpenSfM-style pipeline
-#   1) detect_features : SIFT/ORB keypoints+descriptors, ONCE per image, cached
-#   2) match_features   : candidate pairs only (GPS-neighbor preselection),
-#                          FLANN/BFMatcher + Lowe ratio test + homography RANSAC
-#   3) create_tracks     : Union-Find links verified matches across ALL pairs
-#                          into tracks -- a track is one physical feature seen
-#                          in N images, including images that were never
-#                          directly matched to each other (bridged through a
-#                          third image), which pairwise matching alone cannot
-#                          give you
-#   4) fill each target using every image reachable via a SHARED TRACK,
+#   1) detect_features : SIFT keypoints+descriptors, ONCE per image, cached
+#   2) BoW candidate selection : GLOBAL visual-similarity retrieval (not
+#      GPS/index-local) picks which pairs are worth attempting to match
+#   3) match_features   : FLANN/BFMatcher + Lowe ratio test + homography
+#      RANSAC on those candidate pairs (false-positive BoW candidates --
+#      e.g. two unrelated patches of similar-looking vegetation -- simply
+#      fail RANSAC verification here and are dropped, same as any SfM
+#      pipeline using retrieval-based candidates)
+#   4) create_tracks     : Union-Find links verified matches across ALL
+#      pairs into tracks -- a track is one physical feature seen in N
+#      images, including images never directly matched to each other
+#   5) fill each target using every image reachable via a SHARED TRACK,
 #      fitting one direct homography per (source, target) from the pooled
-#      track correspondences (richer + more stable than composing multiple
-#      pairwise homographies through explicit hops)
+#      track correspondences, composited with soft feathering at the seams
 # =====================================================================
 
 def _load_warped_thermal_bgra(path):
@@ -1034,9 +1063,10 @@ def extract_features(idx, path, detector, cfg):
 
 
 def match_pair(pts_a, descs_a, pts_b, descs_b, norm_type, cfg):
-    """Candidate-pair feature matching: FLANN (SIFT) or Hamming BFMatcher
-    (ORB) + Lowe ratio test + homography RANSAC verification -- mirrors
-    OpenSfM's match_features (FLANN) + geometric verification step."""
+    """FLANN (SIFT) or Hamming BFMatcher (ORB) + Lowe ratio test + homography
+    RANSAC verification -- mirrors OpenSfM's match_features + geometric
+    verification. Returning None here is how a bad BoW candidate (visually
+    similar but not actually overlapping) gets silently rejected."""
     dz = cfg["densify"]
     if len(descs_a) < 2 or len(descs_b) < 2:
         return None
@@ -1060,6 +1090,28 @@ def match_pair(pts_a, descs_a, pts_b, descs_b, norm_type, cfg):
 
     inlier_pairs = [good[k] for k in range(len(good)) if mask.ravel()[k]]
     return H, int(mask.sum()), inlier_pairs
+
+
+def _feather_composite(base, base_filled, add_bgr, add_alpha, feather_px):
+    """Composite add_bgr into base wherever add_alpha is valid and base isn't
+    filled yet, with a soft-edged blend (distance-transform feathering) at
+    the boundary instead of a hard cutoff -- reduces visible seams between
+    sources captured at different times/positions, the cheap panorama-
+    stitching trick (full multi-band blending would help more but is a much
+    bigger lift)."""
+    new_only = (add_alpha > 0) & (~base_filled)
+    if not new_only.any():
+        return base, base_filled
+    if feather_px <= 0:
+        base[new_only] = add_bgr[new_only]
+        return base, (base_filled | new_only)
+
+    dist = cv2.distanceTransform(new_only.astype(np.uint8) * 255, cv2.DIST_L2, 3)
+    w = np.clip(dist / float(feather_px), 0, 1)[..., None]
+    base = base.astype(np.float32)
+    base[new_only] = (w[new_only] * add_bgr[new_only].astype(np.float32)
+                       + (1 - w[new_only]) * base[new_only])
+    return base.astype(np.uint8), (base_filled | new_only)
 
 
 def densify_with_neighbors(cfg):
@@ -1092,56 +1144,33 @@ def densify_with_neighbors(cfg):
     if not run_now:
         return []
 
-    xy_by_idx, no_gps = ({}, list(by_idx)) if not dz.get("use_gps", True) else build_spatial_index(pairs)
-    tree = idx_list = None
-    if xy_by_idx:
-        try:
-            from scipy.spatial import cKDTree
-            idx_list = list(xy_by_idx.keys())
-            tree = cKDTree(np.array([xy_by_idx[i] for i in idx_list]))
-        except ImportError:
-            print("[WARN] scipy.spatial.cKDTree unavailable -- falling back to index-window neighbors.")
-            xy_by_idx, tree = {}, None
-    print(f"GPS-based spatial index: {len(xy_by_idx)}/{len(by_idx)} images have usable GPS EXIF"
-          + (f" ({len(no_gps)} will use index-window fallback)" if no_gps else ""))
-
-    def candidate_ids(idx):
-        """Candidate pairs to actually MATCH (GPS-neighbor preselection, like
-        ODM/OpenSfM) -- NOT the final set of images used to fill a target;
-        tracks (built below) extend reach beyond this via bridging."""
-        if tree is None or idx not in xy_by_idx:
-            return _index_window_neighbors(idx, have_warped, dz["neighbor_window"])
-        radius = dz["neighbor_radius_m"] if dz["neighbor_radius_m"] is not None else float("inf")
-        iis = tree.query_ball_point(xy_by_idx[idx], r=radius)
-        cands = [idx_list[ii] for ii in iis if idx_list[ii] != idx and idx_list[ii] in have_warped]
-        cap = dz.get("max_candidates_per_image")
-        if cap and len(cands) > cap:
-            d = [math.hypot(*(np.subtract(xy_by_idx[c], xy_by_idx[idx]))) for c in cands]
-            cands = [c for _, c in sorted(zip(d, cands))[:cap]]
-        return cands
-
-    # ---- images actually in play this run: targets + everything within
-    # reach of any target, so tracks can bridge across the whole neighborhood ----
-    involved = set(run_now)
-    for idx in run_now:
-        involved.update(candidate_ids(idx))
-    involved &= have_warped
-
+    # ---- 1) detect_features on EVERY warped-thermal image (global pool --
+    # BoW retrieval needs the whole corpus, not just a local neighborhood
+    # of run_now). Cached, so this is a one-time cost across all runs. ----
     detector, norm_type = build_feature_detector(cfg)
-    print(f"1) detect_features: {dz['feature_detector'].upper()} on {len(involved)} images (cached to disk)...")
+    print(f"1) detect_features: {dz['feature_detector'].upper()} on {len(have_warped)} images (cached to disk)...")
     feats = {}
-    for idx in involved:
+    for idx in have_warped:
         vpath, _ = by_idx[idx]
         feats[idx] = extract_features(idx, vpath, detector, cfg)
 
-    print("2) match_features: verifying candidate pairs (FLANN/BF + ratio test + RANSAC)...")
+    # ---- 2) GLOBAL candidate selection via Bag-of-Visual-Words retrieval ----
+    print("2) BoW candidate selection: building/loading vocabulary + per-image histograms...")
+    vocab = build_or_load_vocabulary(cfg, feats)
+    bow_vectors = compute_bow_vectors(feats, vocab)
+    candidates_by_idx = bow_top_candidates(bow_vectors, dz["top_m_candidates"])
+
+    # ---- 3) match_features on candidate pairs (verified via RANSAC) ----
+    print("3) match_features: verifying BoW-selected candidate pairs...")
+    involved = set(run_now)
+    for idx in run_now:
+        involved.update(candidates_by_idx.get(idx, []))
+
     uf = UnionFind()
-    pair_cache = {}  # (min,max) -> (H min->max, inliers) or (None, 0) -- fallback if a pair has no shared track
+    pair_cache = {}
     computed_pairs = set()
     for idx in involved:
-        for nidx in candidate_ids(idx):
-            if nidx not in involved:
-                continue
+        for nidx in candidates_by_idx.get(idx, []):
             key = (min(idx, nidx), max(idx, nidx))
             if key in computed_pairs:
                 continue
@@ -1155,23 +1184,23 @@ def densify_with_neighbors(cfg):
             pair_cache[key] = (H, inliers)
             for i, j in inlier_pairs:
                 uf.union((a, i), (b, j))
+    n_verified = sum(1 for v in pair_cache.values() if v[0] is not None)
+    print(f"   {n_verified}/{len(computed_pairs)} candidate pairs verified (passed RANSAC)")
 
-    print("3) create_tracks: linking verified matches across all pairs...")
+    # ---- 4) create_tracks ----
     groups = {}
     for node in list(uf.parent):
         groups.setdefault(uf.find(node), []).append(node)
     tracks = [obs for obs in groups.values() if len({im for im, _ in obs}) >= dz["min_track_len"]]
     n_multi = sum(1 for t in tracks if len({im for im, _ in t}) >= 3)
-    print(f"   {len(tracks)} tracks from {len(computed_pairs)} verified pairs ({n_multi} seen in 3+ images)")
+    print(f"4) create_tracks: {len(tracks)} tracks ({n_multi} seen in 3+ images)")
 
-    tracks_by_image = {}  # image -> {kp_idx: track_id}
+    tracks_by_image = {}
     for tid, obs in enumerate(tracks):
         for im, kp in obs:
             tracks_by_image.setdefault(im, {})[kp] = tid
 
     def shared_track_correspondences(a, b):
-        """(pts_in_a, pts_in_b) for every track BOTH a and b participate in --
-        includes pairs bridged through a third image, not just direct matches."""
         ta = tracks_by_image.get(a, {})
         tb_by_tid = {tid: kp for kp, tid in tracks_by_image.get(b, {}).items()}
         src, dst = [], []
@@ -1182,9 +1211,6 @@ def densify_with_neighbors(cfg):
         return np.array(src), np.array(dst)
 
     def homography_via_tracks(a, b):
-        """Homography a->b: prefer fitting fresh from ALL track-shared points
-        (richer than a single direct pairwise match); fall back to the direct
-        pairwise result if too few shared tracks."""
         src, dst = shared_track_correspondences(a, b)
         if len(src) >= dz["min_matches"]:
             H, mask = estimate_homography_robust(src, dst, dz["ransac_thresh"], dz["ransac_confidence"])
@@ -1196,7 +1222,8 @@ def densify_with_neighbors(cfg):
             return None, 0
         return (H if a == key[0] else np.linalg.inv(H)), inl
 
-    print("4) filling targets from every track-reachable image...")
+    # ---- 5) fill each target from every track-reachable image ----
+    print("5) filling targets from every track-reachable image...")
     n_ok, n_err = 0, 0
     for idx in run_now:
         try:
@@ -1221,7 +1248,7 @@ def densify_with_neighbors(cfg):
                 H, inl = homography_via_tracks(nidx, idx)
                 if H is not None:
                     scored.append((nidx, H, inl))
-            scored.sort(key=lambda t: -t[2])  # most track-supported first
+            scored.sort(key=lambda t: -t[2])
 
             for nidx, H_n_to_target, inl in scored:
                 n_bgr, n_alpha = _load_warped_thermal_bgra(os.path.join(warped_dir, f"{nidx}_T_warped.png"))
@@ -1233,9 +1260,7 @@ def densify_with_neighbors(cfg):
                 warped_bgr = cv2.warpPerspective(n_bgr, H_full, out_size)
                 warped_alpha = cv2.warpPerspective(n_alpha, H_full, out_size, flags=cv2.INTER_NEAREST, borderValue=0)
 
-                new_fill = (warped_alpha > 0) & (~filled)
-                dense[new_fill] = warped_bgr[new_fill]
-                filled |= (warped_alpha > 0)
+                dense, filled = _feather_composite(dense, filled, warped_bgr, warped_alpha, dz["feather_px"])
                 n_sources += 1
 
             final_coverage = float(filled.mean())
@@ -1249,6 +1274,7 @@ def densify_with_neighbors(cfg):
 
     print(f"\nThis run: {n_ok} ok, {n_err} error, {len(run_now)} total")
     return run_now
+
 
 
 def main(cfg=CONFIG):
