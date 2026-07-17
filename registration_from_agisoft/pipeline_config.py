@@ -17,45 +17,24 @@ CONFIG = dict(
     dry_run=False,
     organize_max_per_run=None,      # None = organize everything found this run
 
-    # ---- Step 2a (PRIMARY): SfM rig reconstruction ----
-    # This is the preferred path: OpenSfM reconstructs BOTH cameras jointly
-    # as a rigid rig (native rig support -- see pipeline_sfm.py), so no
-    # hand-decomposed homography, no guessed composition order. Every image
-    # this succeeds for gets a REAL per-image 3D pose for both cameras.
     # ---- Step 2a (PRIMARY): where do VISIBLE camera poses come from? ----
-    pose_source="agisoft",  # "agisoft" (recommended if you already have an Agisoft project --
-                             # reuses its bundle adjustment, no Docker/SfM needed) or "opensfm"
-                             # (runs OpenSfM rig reconstruction itself, see pipeline_sfm.py).
-                             # Either way, thermal NEVER goes through SfM/bundle adjustment --
-                             # its pose is always derived as (visible pose) + (rig transform
-                             # self-calibrated in pipeline_calibrate_2d.py from thermal-visible
-                             # LoFTR matches), which is what pipeline_calibrate_2d.py is for.
+    pose_source="agisoft",  # "agisoft" (you have this -- reuses your project's own bundle
+                             # adjustment, NO Docker/OpenSfM/ODM needed at all) or "opensfm" (an
+                             # ALTERNATIVE for when you DON'T have an Agisoft project -- runs OpenSfM
+                             # itself via Docker; see pipeline_sfm.py. Needs its own sfm=dict config
+                             # block added back in -- removed here since unused with "agisoft").
+                             # Either way, thermal NEVER goes through SfM/bundle adjustment -- its
+                             # pose is always derived as (visible pose) + (rig transform self-
+                             # calibrated in pipeline_calibrate_2d.py from thermal-visible LoFTR
+                             # matches), which is what pipeline_calibrate_2d.py is for.
 
     agisoft=dict(
-        xml_path=r"PATH\TO\full_flight1_camera.xml",   # File > Export > Export Cameras > "Agisoft XML"
+        xml_path=r"E:\drone_090426\full_flight1_camera.xml",   # <-- CHANGE THIS to your camera XML path
+                                                                  # (File > Export > Export Cameras > "Agisoft XML")
         dem_epsg=None,   # EPSG code of your LAS point cloud's CRS (needed to query the DEM in
                           # pipeline_dem.py -- the chunk's own <reference> WKT is WGS84/EPSG:4326,
                           # NOT necessarily what you exported the LAS in). Check the LAS file's
                           # .prj sidecar or your export settings; None = DEM path stays disabled.
-    ),
-
-    sfm=dict(
-        enabled=True,
-        project_dir=r"E:\drone_090426\Raw_images\DCIM_1\DJI_202604090901_001_zoneseuils1\sfm_rig",
-        opensfm_bin=None,           # path to the `opensfm` executable/script inside your Docker image,
-                                     # e.g. "/code/SuperBuild/install/bin/opensfm" for an ODM-based image --
-                                     # check `docker run --rm --entrypoint find <image> / -iname opensfm`
-                                     # if unsure. None = try a few common ODM-image locations automatically.
-        docker_image="opendronemap/odm:latest",   # or your custom image, e.g. monsieurthetran/odm-custom:latest
-        rig_pattern={"visible": "(_V)\\.", "thermal": "(_T)\\."},  # passed to `opensfm create_rig` --
-                                     # VERIFY with `opensfm create_rig --help` inside your image; this is
-                                     # built from OpenSfM's documented pattern syntax but not tested here.
-        skip_if_reconstruction_exists=True,
-        ground_z=None,              # None = estimate from the reconstruction's own camera heights
-                                     # (median optical-center Z, since OpenSfM places the ground near
-                                     # Z=0 when GPS is used). Same planar-scene assumption as the whole
-                                     # pipeline; a real DEM would remove this approximation entirely.
-        warp_grid_step_px=20,       # dense-warp remap grid spacing (native px) before upsampling
     ),
 
     # ---- OPTIONAL: real terrain height from an Agisoft/any LAS point cloud
