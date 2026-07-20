@@ -169,10 +169,26 @@ def apply_pipeline(cfg):
 
     if pose_source == "agisoft" and cfg.get("agisoft", {}).get("xml_path"):
         import pipeline_agisoft as pag
+        from pipeline_organize import load_original_name_to_organized_path
         from pipeline_calibrate_2d import calibrate_2d
         try:
-            visible_paths_by_label = {os.path.basename(v): v for _, v, _ in pairs}
-            visible_poses = pag.load_agisoft_poses(cfg, visible_paths_by_label)
+            # Agisoft XML camera labels are the ORIGINAL DJI filenames --
+            # organize() renamed the actual files on disk, so bridge the two
+            # via file_mapping.csv (original name -> organized path).
+            original_to_organized = load_original_name_to_organized_path(cfg)
+            visible_poses_by_original_name = pag.load_agisoft_poses(cfg, original_to_organized)
+            # re-key to ORGANIZED basenames so everything downstream (validation,
+            # rig derivation, the apply loop) matches how the rest of the
+            # pipeline (thermal_poses_3d, pairs, etc.) already identifies images
+            organized_to_original = {v: k for k, v in original_to_organized.items()}
+            visible_poses = {}
+            for _, vpath, _ in pairs:
+                orig_name = organized_to_original.get(vpath)
+                if orig_name and orig_name in visible_poses_by_original_name:
+                    visible_poses[os.path.basename(vpath)] = visible_poses_by_original_name[orig_name]
+            print(f"Matched {len(visible_poses)}/{len(visible_poses_by_original_name)} Agisoft-aligned "
+                  f"cameras to organized files via file_mapping.csv")
+
             print("\nCalibrating 2D homography (needed both as the fallback AND to derive the rig)...")
             M_work, work_size, tps, distortion = calibrate_2d(cfg)
             thermal_poses_3d = _get_agisoft_thermal_poses(cfg, pairs, visible_poses, M_work, work_size)

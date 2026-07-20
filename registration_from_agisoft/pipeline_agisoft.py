@@ -57,6 +57,51 @@ import xml.etree.ElementTree as ET
 
 import cv2
 import numpy as np
+from PIL import Image
+
+
+# =====================================================================
+# EXIF intrinsics -- ONLY needed for the THERMAL camera, since Agisoft's
+# XML calibration (K_from_sensor below) covers visible but never touched
+# thermal at all.
+# =====================================================================
+
+_TAG_FOCAL_LENGTH = 37386
+_TAG_FOCAL_LENGTH_35MM = 41989
+_TAG_FPX_RES = 41486
+_TAG_FPX_UNIT = 41488
+
+
+def get_camera_intrinsics_from_exif(path):
+    """Approximate pixel focal length (fx=fy, principal point at image
+    center) from EXIF -- prefers FocalLengthIn35mmFilm (the standard
+    fallback OpenSfM/ODM themselves use when no calibration file is
+    available: focal_px = FocalLengthIn35mm * max(w,h) / 36.0), falling
+    back to FocalLength(mm) + FocalPlaneXResolution. Returns None if
+    neither is available."""
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+            exif = im.getexif()
+        focal_35 = exif.get(_TAG_FOCAL_LENGTH_35MM)
+        if focal_35:
+            focal_px = float(focal_35) * max(w, h) / 36.0
+            return dict(fx=focal_px, fy=focal_px, cx=w / 2.0, cy=h / 2.0, width=w, height=h, source="35mm-equivalent")
+        focal_mm = exif.get(_TAG_FOCAL_LENGTH)
+        fpx_res = exif.get(_TAG_FPX_RES)
+        fpx_unit = exif.get(_TAG_FPX_UNIT)
+        if focal_mm and fpx_res:
+            unit_mm = {2: 25.4, 3: 10.0}.get(int(fpx_unit) if fpx_unit else 2, 25.4)
+            sensor_width_mm = w / (float(fpx_res) / unit_mm)
+            focal_px = float(focal_mm) * w / sensor_width_mm
+            return dict(fx=focal_px, fy=focal_px, cx=w / 2.0, cy=h / 2.0, width=w, height=h, source="focal-plane-resolution")
+        return None
+    except Exception:
+        return None
+
+
+def K_from_intrinsics(intr):
+    return np.array([[intr["fx"], 0, intr["cx"]], [0, intr["fy"], intr["cy"]], [0, 0, 1]], dtype=np.float64)
 
 
 # =====================================================================

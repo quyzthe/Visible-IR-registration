@@ -276,6 +276,22 @@ def find_pairs(visible_dir, thermal_dir):
     return [(idx, vis[idx], th[idx]) for idx in common]
 
 
+def load_original_name_to_organized_path(cfg):
+    """{original_visible_basename: organized_visible_path} -- bridges
+    Agisoft XML camera labels (which are the ORIGINAL DJI filenames, e.g.
+    'DJI_20260409091358_0001_V.JPG') to the renamed files organize()
+    actually produced ('DJI_0001_V.JPG'), via file_mapping.csv."""
+    import csv
+    mapping_path = os.path.join(cfg["register_results_dir"], "file_mapping.csv")
+    if not os.path.exists(mapping_path):
+        raise RuntimeError(f"{mapping_path} not found -- run organize() first.")
+    out = {}
+    with open(mapping_path, newline="") as f:
+        for row in csv.DictReader(f):
+            out[os.path.basename(row["original_visible"])] = row["new_visible"]
+    return out
+
+
 if __name__ == "__main__":
     from pipeline_config import CONFIG
     organize(CONFIG)

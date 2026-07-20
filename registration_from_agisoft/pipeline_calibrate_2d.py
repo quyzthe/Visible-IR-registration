@@ -105,7 +105,7 @@ def build_undistort_map(work_size, native_shape, center_work, k, scale_work, gri
     map_x_work = cv2.resize(dist_pts[:, 0].reshape(gy.shape).astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
     map_y_work = cv2.resize(dist_pts[:, 1].reshape(gy.shape).astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
     sx, sy = Wn / W, Hn / H
-    return map_x_work * 0 + cv2.resize(map_x_work, (Wn, Hn), interpolation=cv2.INTER_LINEAR) * sx, \
+    return cv2.resize(map_x_work, (Wn, Hn), interpolation=cv2.INTER_LINEAR) * sx, \
            cv2.resize(map_y_work, (Wn, Hn), interpolation=cv2.INTER_LINEAR) * sy
 
 
