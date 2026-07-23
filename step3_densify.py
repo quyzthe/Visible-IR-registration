@@ -1,51 +1,61 @@
 """
-STEP 3 (standalone) -- densify thermal coverage using a LOCAL, TRIANGULATED
-mesh warp instead of one global homography per neighbor.
+STEP 3 (standalone) -- densify thermal coverage using the SAME two-stage
+approach organize_and_register.py's Step 2 calibration uses for
+thermal<->visible: ONE robust homography fit via RANSAC from ALL matched
+points, then a smooth thin-plate-spline (TPS) correction on top from the
+inliers -- instead of a raw Delaunay-triangulated mesh.
 
 PREREQUISITE: Steps 1 and 2 of organize_and_register.py have already been
 run (visible_dir/thermal_dir are organized, register_results/warped_thermal
 exists). This script only READS those outputs, plus ODM's opensfm/ outputs
 -- it never touches Step 1/2, and Step 1/2 never need to run again.
 
-WHY A MESH INSTEAD OF ONE HOMOGRAPHY PER NEIGHBOR
---------------------------------------------------
-The old Step 3 fit ONE homography per (target, neighbor) pair from every
-track-shared point between them, then warped the ENTIRE neighbor image with
-that single transform. That's an approximation: it assumes the whole
-overlap between the two images lies on one shared plane. Real terrain
-(riverbanks, vegetation, slopes) isn't planar, so the single homography is
-increasingly wrong the further a point sits from wherever the fit happened
-to center its error.
+WHY HOMOGRAPHY+TPS INSTEAD OF A RAW TRIANGULATED MESH
+------------------------------------------------------
+An earlier version of this script triangulated every matched point
+(Delaunay) and warped each small triangle with its own affine transform.
+That sounds locally adaptive, but it has a real failure mode: wherever
+matched points are sparse or unevenly spread (routine with real feature
+detections -- dense over textured ground, sparse over water/shadow/roads),
+Delaunay produces some LARGE, poorly-constrained triangles, each warped
+from just 3 widely-separated points with no robustness check at all. A
+single mismatched or noisy point among those 3 can visibly distort an
+entire large patch -- which is exactly the "warp thiếu chính xác" behavior
+this was producing.
 
-This version instead:
-  1) takes EVERY matched point between a target and a neighbor (via ODM's
-     matches, bridged through tracks exactly as before -- no point is
-     dropped in favor of "the best" subset the way a single RANSAC fit
-     implicitly discards inliers/outliers),
-  2) builds a Delaunay triangulation over those points in the TARGET image,
-  3) warps each small triangle independently with its own affine transform,
-     fit from just that triangle's 3 corners.
+The fix is to use the SAME two-stage method organize_and_register.py's
+calibrate() already uses successfully for thermal<->visible:
+  1) fit ONE robust homography (RANSAC/MAGSAC) from ALL matched points --
+     a single global relationship, robust to individual bad matches (the
+     RANSAC step identifies and discards outliers instead of blindly
+     trusting whichever 3 points happen to be adjacent),
+  2) THEN a smooth TPS correction on top, fit from the RANSAC inliers --
+     this is what makes it still "use every point" and still adapt to
+     real non-planar terrain, but the correction is a single smooth field
+     over the whole region (going through/near every inlier) instead of
+     a patchwork of independent, unconstrained flat facets.
 
-A triangle a few dozen pixels across is planar to an excellent approximation
-almost everywhere, even where the *overall* overlap region is not -- so this
-adapts to real local terrain instead of assuming one shared plane, and it
-literally uses every match as a control point, not just whichever ones a
-global model happened to fit best.
-
-Coverage still only extends to the convex hull of each neighbor's matched
-points (same as a homography-based warp would also be limited to its
-overlap region) -- an image with very few matches to a given neighbor
-simply contributes little there, same as before.
+NEVER SKIPPING A NEIGHBOR
+--------------------------
+Every image reachable via a shared track is attempted, regardless of how
+many points it shares with the target (the earlier `min_matches` cutoff in
+this step, which silently dropped low-count neighbors from consideration
+entirely, is gone). The transform fit degrades gracefully with how much
+data is actually available: homography+TPS with >=4 points, a plain affine
+with exactly 3, a translation-only shift with 1-2 -- something is always
+attempted, down to a single shared point. Only a neighbor with ZERO shared
+points is skipped, because there is nothing at all to warp from.
+(Track construction itself -- deciding whether a raw ODM match is trusted
+enough to link two images' features into one track in the first place --
+still requires a minimum of CONFIG['densify']['min_matches'] points, to
+avoid a handful of possibly-spurious points corrupting the SHARED track
+graph other neighbor pairs also rely on. That's a different concern from
+"don't skip a neighbor already known to be reachable".)
 
 MEMORY: everything below works on a CROPPED region sized to each pair's
-actual matched-point extent, never a full native-resolution (e.g.
-4032x3024) canvas per neighbor. An earlier version allocated a full-frame
-output canvas (~48MB) for every single neighbor, and a target image with
-dozens of reachable neighbors could easily need >1GB of allocate/discard
-churn just for itself -- repeated across hundreds of target images in one
-run, that fragments/exhausts memory even when each individual allocation
-looks modest (which is exactly the 'OutOfMemoryError ... 36MB' pattern this
-produced). Working in small, actual-extent-sized crops avoids that.
+actual matched-point extent (plus the source region a homography's inverse
+maps back to), never a full native-resolution (e.g. 4032x3024) canvas per
+neighbor.
 
 Run with: python step3_densify.py
 """
@@ -59,7 +69,6 @@ import pickle
 
 import cv2
 import numpy as np
-from scipy.spatial import Delaunay
 
 
 # =====================================================================
@@ -82,28 +91,42 @@ CONFIG = dict(
 
         # ---- 2) candidate selection + 3) match verification: both come
         # directly from ODM's opensfm/matches/*.pkl.gz -- see CONFIG['odm'] ----
-        ransac_thresh=3.0,           # only used if odm.verify_planar_homography=True
-        ransac_confidence=0.999,
-        min_matches=15,              # min shared points a (target, neighbor) pair needs to
-                                      # contribute anything -- also the practical floor for a
-                                      # triangulation that's actually worth having (Delaunay
-                                      # itself only needs 4, but that's too sparse to trust)
+        min_matches=15,              # min points a raw ODM pair needs to be trusted enough to
+                                      # link two images into the SHARED track graph in the first
+                                      # place (other neighbor pairs' reachability depends on this
+                                      # same graph, so it's worth protecting) -- NOT used to skip
+                                      # a neighbor in Step 5 once it's already known reachable;
+                                      # see the module docstring.
 
         # ---- 4) create_tracks ----
         min_track_len=2,             # keep tracks observed in at least this many images
 
-        # ---- 5) fill: mesh-warp every reachable neighbor's matched points into
-        # a Delaunay triangulation, composite triangle-warped results in order
-        # of most-shared-points-first, dilate+feather at each neighbor's outer
-        # boundary the same way as before -- all in a CROPPED region sized to
-        # each pair's actual point extent, never a full native-resolution canvas ----
-        mask_dilate_px=8,            # grow each neighbor's mesh-covered silhouette (and the
-                                      # target's own warped_thermal) by this many px before
-                                      # compositing -- the triangulated warp is locally accurate,
-                                      # but coverage still hard-stops at the convex hull of that
-                                      # neighbor's matched points, and two neighbors' hulls won't
-                                      # perfectly touch at the pixel -- a small overlap margin
-                                      # closes that instead of leaving a visible seam.
+        # ---- 5) fill: for EVERY reachable neighbor (none skipped for having
+        # "too few" points -- see module docstring), fit ONE robust homography
+        # via RANSAC from all its shared points (same method Step 2 uses for
+        # thermal<->visible), then a smooth TPS correction from the inliers.
+        # Falls back to a plain affine (3 points) or translation (1-2 points)
+        # when there's too little data for a homography -- always attempts
+        # SOMETHING. All composited in a CROPPED region, never a full
+        # native-resolution canvas. ----
+        ransac_thresh=3.0,
+        ransac_confidence=0.999,
+        tps_min_points=12,           # min RANSAC inliers needed to additionally fit a TPS
+                                      # correction on top of the homography (below this, the
+                                      # homography alone is used -- too few points for a
+                                      # trustworthy smooth-surface fit, same reasoning as
+                                      # organize_and_register.py's local_refinement.min_points)
+        tps_smoothing=2.0,           # regularization: 0 = exact interpolation (noisy), higher = smoother
+        tps_grid_step_px=20,         # TPS evaluated on a grid this coarse (native px), then upsampled
+        tps_max_correction_px=15.0,  # clip correction magnitude -- guards against TPS extrapolation
+                                      # blowing up far from training points
+
+        mask_dilate_px=8,            # grow each neighbor's warped silhouette (and the target's
+                                      # own warped_thermal) by this many px before compositing --
+                                      # warpPerspective leaves ragged/gappy mask edges, and two
+                                      # independently-fit transforms won't perfectly agree on a
+                                      # shared boundary to the pixel -- a small overlap margin
+                                      # closes that instead of a visible gap.
         feather_px=15,               # soft-blend width (px, native resolution) at the boundary
                                       # where a new source fills in. 0 = hard cutoff, no blend.
 
@@ -199,6 +222,38 @@ def estimate_homography_robust(src_pts, dst_pts, thresh, confidence):
         except cv2.error:
             continue
     raise RuntimeError("estimate_homography_robust: no supported robust method worked")
+
+
+def estimate_affine_robust(src_pts, dst_pts, thresh, confidence):
+    for method in (getattr(cv2, "USAC_MAGSAC", None), cv2.RANSAC):
+        if method is None:
+            continue
+        try:
+            M, mask = cv2.estimateAffine2D(
+                src_pts, dst_pts, method=method,
+                ransacReprojThreshold=thresh, confidence=confidence, maxIters=5000,
+            )
+            return M, mask
+        except cv2.error:
+            continue
+    return None, None
+
+
+def to_3x3(M):
+    if M.shape == (3, 3):
+        return M.astype(np.float64)
+    out = np.eye(3, dtype=np.float64)
+    out[:2, :] = M
+    return out
+
+
+def apply_homogeneous(M3x3, pts):
+    """Transform Nx2 points through a 3x3 matrix with a proper perspective
+    divide -- works for a true homography AND for an affine padded to 3x3
+    (whose bottom row [0,0,1] makes the divide a no-op)."""
+    pts_h = np.hstack([pts, np.ones((len(pts), 1))])
+    out_h = pts_h @ M3x3.T
+    return out_h[:, :2] / out_h[:, 2:3]
 
 
 # =====================================================================
@@ -487,92 +542,53 @@ class UnionFind:
 # a CROPPED region of the target -- never a full native-resolution canvas
 # =====================================================================
 
-def mesh_warp_neighbor_into(dense, filled, src_bgr, src_alpha, dst_pts, src_pts, feather_px, dilate_px):
-    """Triangulate dst_pts<->src_pts (both Nx2, native pixel coords) and
-    composite src_bgr/src_alpha's mesh-warped content directly into
-    dense/filled (mutated in place -- numpy views), working ONLY within the
-    bounding box of dst_pts (plus a small margin for dilation) -- never a
-    full native-resolution canvas. A neighbor's actual overlap with the
-    target is usually a small fraction of the whole frame; allocating a
-    full-size buffer per neighbor wastes huge amounts of memory on mostly-
-    empty canvases, and doing that across dozens of neighbors x hundreds of
-    target images is what exhausts memory in one run.
-
-    Each small triangle gets its own affine transform fit from just its 3
-    corners -- a far better local approximation of real (non-planar)
-    terrain than one shared plane over the whole overlap. Every matched
-    point becomes a mesh vertex -- nothing is discarded the way a single
-    robust-homography fit implicitly discards points that don't agree with
-    one global model.
-
-    Coverage is limited to the convex hull of dst_pts (same limitation a
-    homography-based warp would have too) -- pixels outside it are left
-    untouched."""
-    if len(dst_pts) < 4:
-        return dense, filled
+def fit_tps_correction_local(dst_inlier, src_inlier, H, crop_size, smoothing, grid_step, max_correction_px):
+    """Smooth (thin-plate-spline) residual correction, in DESTINATION
+    (target-crop) coordinates, layered on top of the homography H
+    (neighbor->target) -- the exact same technique
+    organize_and_register.py's fit_tps_correction uses for thermal<->
+    visible, just operating on a native-resolution CROP here instead of
+    Step 2's work_size canvas. Returns (map_x, map_y) at crop_size for
+    cv2.remap, or None if scipy is unavailable."""
     try:
-        tri = Delaunay(dst_pts)
-    except Exception:
-        return dense, filled  # degenerate point set (e.g. all collinear) -- nothing usable
+        from scipy.interpolate import RBFInterpolator
+    except ImportError:
+        return None
 
-    H, W = dense.shape[:2]
-    margin = dilate_px + 2
-    x0 = max(int(np.floor(dst_pts[:, 0].min())) - margin, 0)
-    y0 = max(int(np.floor(dst_pts[:, 1].min())) - margin, 0)
-    x1 = min(int(np.ceil(dst_pts[:, 0].max())) + margin, W)
-    y1 = min(int(np.ceil(dst_pts[:, 1].max())) + margin, H)
-    if x1 <= x0 or y1 <= y0:
-        return dense, filled
-    cw, ch = x1 - x0, y1 - y0
+    predicted_dst = apply_homogeneous(to_3x3(H), src_inlier)  # where H puts each neighbor inlier
+    delta = dst_inlier - predicted_dst                         # correction needed AT the true target location
 
-    local_bgr = np.zeros((ch, cw, 3), np.uint8)
-    local_alpha = np.zeros((ch, cw), np.uint8)
-    dst_local = dst_pts - (x0, y0)
+    rbf_dx = RBFInterpolator(dst_inlier, delta[:, 0], kernel="thin_plate_spline", smoothing=smoothing)
+    rbf_dy = RBFInterpolator(dst_inlier, delta[:, 1], kernel="thin_plate_spline", smoothing=smoothing)
 
-    for simplex in tri.simplices:
-        t_dst = dst_local[simplex].astype(np.float32)  # triangle in the LOCAL crop's coords
-        t_src = src_pts[simplex].astype(np.float32)     # same triangle, in the (already-cropped) SOURCE
+    W, H_ = crop_size
+    xs = np.unique(np.append(np.arange(0, W, grid_step), W - 1))
+    ys = np.unique(np.append(np.arange(0, H_, grid_step), H_ - 1))
+    gx, gy = np.meshgrid(xs, ys)
+    grid_pts = np.stack([gx.ravel(), gy.ravel()], axis=1).astype(np.float64)
 
-        rd = cv2.boundingRect(t_dst)
-        rs = cv2.boundingRect(t_src)
-        if rd[2] < 1 or rd[3] < 1 or rs[2] < 1 or rs[3] < 1:
-            continue
+    dx = np.clip(rbf_dx(grid_pts), -max_correction_px, max_correction_px).reshape(gy.shape)
+    dy = np.clip(rbf_dy(grid_pts), -max_correction_px, max_correction_px).reshape(gy.shape)
 
-        t_dst_l = (t_dst - (rd[0], rd[1])).astype(np.float32)
-        t_src_l = (t_src - (rs[0], rs[1])).astype(np.float32)
+    map_x = cv2.resize((gx + dx).astype(np.float32), (W, H_), interpolation=cv2.INTER_LINEAR)
+    map_y = cv2.resize((gy + dy).astype(np.float32), (W, H_), interpolation=cv2.INTER_LINEAR)
+    return map_x, map_y
 
-        src_patch = src_bgr[rs[1]:rs[1] + rs[3], rs[0]:rs[0] + rs[2]]
-        src_alpha_patch = src_alpha[rs[1]:rs[1] + rs[3], rs[0]:rs[0] + rs[2]]
 
-        M = cv2.getAffineTransform(t_src_l, t_dst_l)
-        warped_patch = cv2.warpAffine(src_patch, M, (rd[2], rd[3]),
-                                       flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        warped_alpha_patch = cv2.warpAffine(src_alpha_patch, M, (rd[2], rd[3]),
-                                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
-        tri_mask = np.zeros((rd[3], rd[2]), np.uint8)
-        cv2.fillConvexPoly(tri_mask, np.int32(np.round(t_dst_l)), 255)
-
-        m = (tri_mask > 0) & (warped_alpha_patch > 127)
-        if not m.any():
-            continue
-
-        local_bgr[rd[1]:rd[1] + rd[3], rd[0]:rd[0] + rd[2]][m] = warped_patch[m]
-        local_alpha[rd[1]:rd[1] + rd[3], rd[0]:rd[0] + rd[2]][m] = 255
-
+def _composite_local(dense, filled, x0, y0, x1, y1, local_bgr, local_alpha, dilate_px, feather_px):
+    """Dilate (mask AND color together, else the newly-grown ring would
+    paint invalid black pixels instead of real color) and feather-blend
+    local_bgr/local_alpha into dense/filled at [y0:y1, x0:x1], in place."""
     if dilate_px > 0:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1))
         local_alpha = cv2.dilate(local_alpha, kernel)
-        local_bgr = cv2.dilate(local_bgr, kernel)  # dilate the color too, else the newly-grown
-                                                     # ring would composite invalid black pixels
-                                                     # (warpAffine's borderValue) instead of real color
+        local_bgr = cv2.dilate(local_bgr, kernel)
 
     dense_region = dense[y0:y1, x0:x1]
     filled_region = filled[y0:y1, x0:x1]
     new_only = (local_alpha > 0) & (~filled_region)
     if not new_only.any():
-        return dense, filled
-
+        return
     if feather_px <= 0:
         dense_region[new_only] = local_bgr[new_only]
     else:
@@ -580,9 +596,113 @@ def mesh_warp_neighbor_into(dense, filled, src_bgr, src_alpha, dst_pts, src_pts,
         w_sel = np.clip(dist[new_only] / float(feather_px), 0, 1)[:, None].astype(np.float32)
         blended = w_sel * local_bgr[new_only].astype(np.float32) + (1 - w_sel) * dense_region[new_only].astype(np.float32)
         dense_region[new_only] = np.clip(blended, 0, 255).astype(np.uint8)
+    filled_region |= new_only
 
-    filled_region |= new_only  # dense/filled are mutated in place (numpy views), returned for clarity
-    return dense, filled
+
+def warp_neighbor_into(dense, filled, warped_dir, nidx, target_pts, neighbor_pts, cfg):
+    """Warp neighbor nidx's warped_thermal into dense/filled, covering the
+    region described by target_pts<->neighbor_pts (both Nx2, native pixel
+    coords, matched 1:1 by position). Fits the BEST transform the point
+    count actually supports -- homography+TPS (see module docstring) with
+    >=4 points, a plain affine with exactly 3, a translation-only shift
+    with 1-2 -- so a neighbor is NEVER skipped just for having few shared
+    points; only truly zero shared points contributes nothing. Everything
+    is composited within a CROPPED region of dense/filled, never a full
+    native-resolution canvas."""
+    dz = cfg["densify"]
+    n = len(target_pts)
+    if n < 1:
+        return dense, filled, "none", 0
+
+    Hd, Wd = dense.shape[:2]
+    margin = dz["mask_dilate_px"] + 2
+
+    kind, M, n_used = None, None, 0
+    tps = None
+
+    if n >= 4:
+        H, mask = estimate_homography_robust(neighbor_pts, target_pts, dz["ransac_thresh"], dz["ransac_confidence"])
+        if H is not None:
+            inlier_bool = mask.ravel().astype(bool)
+            if inlier_bool.sum() >= 4:
+                kind, M, n_used = "homography", H, int(inlier_bool.sum())
+                if n_used >= dz["tps_min_points"]:
+                    tps_target = target_pts[inlier_bool]
+                    tps_neighbor = neighbor_pts[inlier_bool]
+
+    if kind is None and n >= 3:
+        Ma, mask_a = estimate_affine_robust(neighbor_pts, target_pts, dz["ransac_thresh"], dz["ransac_confidence"])
+        if Ma is not None:
+            inlier_bool = mask_a.ravel().astype(bool) if mask_a is not None else np.ones(n, bool)
+            if inlier_bool.sum() >= 3:
+                kind, M, n_used = "affine", to_3x3(Ma), int(inlier_bool.sum())
+        if kind is None:
+            # too few/degenerate for RANSAC affine -- exact 3-point fit, no robustness check
+            M3 = cv2.getAffineTransform(neighbor_pts[:3].astype(np.float32), target_pts[:3].astype(np.float32))
+            kind, M, n_used = "affine", to_3x3(M3), 3
+
+    if kind is None:
+        # 1-2 points: translation-only, from the mean offset -- the crudest
+        # transform that still uses the data available, better than nothing
+        offset = (target_pts - neighbor_pts).mean(axis=0)
+        M = np.array([[1, 0, offset[0]], [0, 1, offset[1]], [0, 0, 1]], dtype=np.float64)
+        kind, n_used = "translation", n
+
+    x0 = max(int(np.floor(target_pts[:, 0].min())) - margin, 0)
+    y0 = max(int(np.floor(target_pts[:, 1].min())) - margin, 0)
+    x1 = min(int(np.ceil(target_pts[:, 0].max())) + margin, Wd)
+    y1 = min(int(np.ceil(target_pts[:, 1].max())) + margin, Hd)
+    if x1 <= x0 or y1 <= y0:
+        return dense, filled, kind, 0
+    cw, ch = x1 - x0, y1 - y0
+
+    # inverse-map the target crop's corners through M to find which part of
+    # the neighbor's native frame is actually needed -- avoids loading the
+    # full native-resolution neighbor frame just to use a small piece of it
+    M_inv = np.linalg.inv(M)
+    corners_target = np.array([[x0, y0], [x1, y0], [x0, y1], [x1, y1]], dtype=np.float64)
+    corners_neighbor = apply_homogeneous(M_inv, corners_target)
+    nmargin = 20
+
+    n_bgr_full, n_alpha_full = _load_warped_thermal_bgra(os.path.join(warped_dir, f"{nidx}_T_warped.png"))
+    nh, nw = n_bgr_full.shape[:2]
+    nx0 = max(int(np.floor(corners_neighbor[:, 0].min())) - nmargin, 0)
+    ny0 = max(int(np.floor(corners_neighbor[:, 1].min())) - nmargin, 0)
+    nx1 = min(int(np.ceil(corners_neighbor[:, 0].max())) + nmargin, nw)
+    ny1 = min(int(np.ceil(corners_neighbor[:, 1].max())) + nmargin, nh)
+    if nx1 <= nx0 or ny1 <= ny0:
+        return dense, filled, kind, 0
+    n_bgr = n_bgr_full[ny0:ny1, nx0:nx1]
+    n_alpha = n_alpha_full[ny0:ny1, nx0:nx1]
+    del n_bgr_full, n_alpha_full
+
+    # compose: neighbor_local(crop) -> neighbor_full -> target_full -> target_local(crop)
+    T_uncrop = np.array([[1, 0, nx0], [0, 1, ny0], [0, 0, 1]], dtype=np.float64)
+    T_crop = np.array([[1, 0, -x0], [0, 1, -y0], [0, 0, 1]], dtype=np.float64)
+    M_local = T_crop @ M @ T_uncrop
+
+    warped_bgr = cv2.warpPerspective(n_bgr, M_local, (cw, ch),
+                                      flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    warped_alpha = cv2.warpPerspective(n_alpha, M_local, (cw, ch),
+                                        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    if kind == "homography" and n_used >= dz["tps_min_points"]:
+        tps = fit_tps_correction_local(
+            tps_target - (x0, y0), tps_neighbor - (nx0, ny0), M_local, (cw, ch),
+            dz["tps_smoothing"], dz["tps_grid_step_px"], dz["tps_max_correction_px"],
+        )
+        if tps is not None:
+            map_x, map_y = tps
+            warped_bgr = cv2.remap(warped_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            warped_alpha = cv2.remap(warped_alpha, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    warped_alpha_bin = ((warped_alpha > 127).astype(np.uint8)) * np.uint8(255)
+
+    _composite_local(dense, filled, x0, y0, x1, y1, warped_bgr, warped_alpha_bin,
+                      dz["mask_dilate_px"], dz["feather_px"])
+    return dense, filled, kind, n_used
 
 
 def densify_with_neighbors(cfg):
@@ -764,42 +884,30 @@ def densify_with_neighbors(cfg):
                         reachable.add(im)
 
             # priority order: most shared points first (a reasonable proxy
-            # for reliability/coverage quality -- unlike before, this is no
-            # longer a RANSAC inlier count since no global fit happens)
+            # for reliability/coverage quality). No count-based exclusion
+            # here -- every reachable neighbor is attempted; warp_neighbor_into
+            # itself picks homography+TPS / affine / translation depending
+            # on how many points are actually available, down to 1.
             scored = []
             for nidx in reachable:
                 target_pts, neighbor_pts = shared_track_correspondences(idx, nidx)
-                if len(target_pts) >= dz["min_matches"]:
+                if len(target_pts) >= 1:
                     scored.append((nidx, target_pts, neighbor_pts))
             scored.sort(key=lambda t: -len(t[1]))
 
+            kind_counts = {}
             for nidx, target_pts, neighbor_pts in scored:
-                n_bgr_full, n_alpha_full = _load_warped_thermal_bgra(os.path.join(warped_dir, f"{nidx}_T_warped.png"))
-
-                # crop the neighbor's source to just the region this pair's
-                # points could possibly need -- avoids holding the full
-                # native-resolution neighbor frame (~48MB) in memory for
-                # the whole triangle loop
-                nh, nw = n_bgr_full.shape[:2]
-                nx0 = max(int(np.floor(neighbor_pts[:, 0].min())), 0)
-                ny0 = max(int(np.floor(neighbor_pts[:, 1].min())), 0)
-                nx1 = min(int(np.ceil(neighbor_pts[:, 0].max())) + 1, nw)
-                ny1 = min(int(np.ceil(neighbor_pts[:, 1].max())) + 1, nh)
-                n_bgr = n_bgr_full[ny0:ny1, nx0:nx1].copy()
-                n_alpha = n_alpha_full[ny0:ny1, nx0:nx1].copy()
-                del n_bgr_full, n_alpha_full
-                neighbor_pts_local = neighbor_pts - (nx0, ny0)
-
-                dense, filled = mesh_warp_neighbor_into(
-                    dense, filled, n_bgr, n_alpha,
-                    dst_pts=target_pts, src_pts=neighbor_pts_local,
-                    feather_px=dz["feather_px"], dilate_px=dz["mask_dilate_px"],
+                dense, filled, kind, n_used = warp_neighbor_into(
+                    dense, filled, warped_dir, nidx, target_pts, neighbor_pts, cfg
                 )
-                n_sources += 1
+                if kind != "none":
+                    kind_counts[kind] = kind_counts.get(kind, 0) + 1
+                    n_sources += 1
 
             final_coverage = float(filled.mean())
             cv2.imwrite(os.path.join(dense_dir, f"{idx}_overlay_dense.png"), dense)
-            print(f"[{idx}] {n_sources} source(s) (of {len(reachable)} track-reachable), "
+            kinds_str = ", ".join(f"{k}:{v}" for k, v in sorted(kind_counts.items()))
+            print(f"[{idx}] {n_sources} source(s) (of {len(reachable)} track-reachable, [{kinds_str}]), "
                   f"coverage {base_coverage:.1%} -> {final_coverage:.1%}")
             n_ok += 1
         except Exception as e:
