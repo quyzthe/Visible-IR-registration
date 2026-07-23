@@ -2,6 +2,7 @@
 STEP 4 -- DENSIFY
 
 Fills gaps in each visible image's thermal coverage using overlap between
+<<<<<<< HEAD
 NEIGHBORING visible frames. Two data sources feed this, in order:
 
   0) geometric_fill : images with a real Agisoft pose -- overlap and pixel
@@ -18,6 +19,21 @@ fill step below consume whatever correspondences those two sources
 produced. An image covered by neither source just keeps its own
 single-source coverage from apply() -- it is not a failure, only a
 consequence of not attempting fresh matching here.
+=======
+NEIGHBORING visible frames (same-modality RGB-RGB matching -- far more
+reliable than cross-modal). ODM/OpenSfM-style pipeline:
+
+  1) detect_features : SIFT keypoints+descriptors, ONCE per image, cached
+  2) match candidates : GLOBAL Bag-of-Visual-Words retrieval (not GPS/index
+     proximity -- a candidate pair is chosen by visual similarity across
+     the WHOLE image pool)
+  3) match_features   : FLANN + Lowe ratio test + homography RANSAC
+  4) create_tracks     : Union-Find links verified matches across ALL pairs
+     into tracks, persisted to disk (rgb_matches.csv / rgb_inlier_matches.csv)
+     so later runs only match NEW pairs and tracks.csv accumulates globally
+     across every run, not just the current session
+  5) fill each target from every track-reachable image, feathered compositing
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
 
 Works on whatever warped_thermal/*.png already exists, regardless of
 whether pipeline_apply.py produced it via SfM or the 2D fallback.
@@ -30,7 +46,11 @@ import cv2
 import numpy as np
 
 from pipeline_organize import find_pairs
+<<<<<<< HEAD
 from pipeline_common import load_color, estimate_homography_robust, load_warped_thermal_bgra
+=======
+from pipeline_common import load_gray, load_color, preprocess, full_res_matrix, estimate_homography_robust, load_warped_thermal_bgra
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
 
 
 class UnionFind:
@@ -52,6 +72,116 @@ class UnionFind:
             self.parent[ra] = rb
 
 
+<<<<<<< HEAD
+=======
+def build_feature_detector(dz):
+    if dz["feature_detector"] == "orb":
+        return cv2.ORB_create(nfeatures=dz["n_features"]), cv2.NORM_HAMMING
+    return cv2.SIFT_create(nfeatures=dz["n_features"]), cv2.NORM_L2
+
+
+def extract_features(idx, path, detector, cfg, dz):
+    feat_dir = os.path.join(cfg["register_results_dir"], "rgb_features")
+    cache_path = os.path.join(feat_dir, f"{idx}.npz")
+    if dz["save_features"] and os.path.exists(cache_path):
+        data = np.load(cache_path)
+        return data["pts"], data["descs"]
+    gray = load_gray(path)
+    _, gray_p = preprocess(gray, dz.get("work_size", (640, 480)), 3.0, (8, 8))
+    kps, descs = detector.detectAndCompute(gray_p, None)
+    pts = np.array([kp.pt for kp in kps], dtype=np.float32) if kps else np.zeros((0, 2), np.float32)
+    if descs is None:
+        descs = np.zeros((0, 0), np.float32)
+    if dz["save_features"]:
+        os.makedirs(feat_dir, exist_ok=True)
+        np.savez(cache_path, pts=pts, descs=descs)
+    return pts, descs
+
+
+def match_pair(pts_a, descs_a, pts_b, descs_b, norm_type, dz):
+    if len(descs_a) < 2 or len(descs_b) < 2:
+        return None
+    if norm_type == cv2.NORM_L2:
+        matcher = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=50))
+        knn = matcher.knnMatch(descs_a.astype(np.float32), descs_b.astype(np.float32), k=2)
+    else:
+        matcher = cv2.BFMatcher(norm_type)
+        knn = matcher.knnMatch(descs_a, descs_b, k=2)
+    good = [(m.queryIdx, m.trainIdx) for m, n in knn if m.distance < dz["match_ratio"] * n.distance]
+    if len(good) < dz["min_matches"]:
+        return None
+    src = np.array([pts_a[i] for i, _ in good])
+    dst = np.array([pts_b[j] for _, j in good])
+    H, mask = estimate_homography_robust(src, dst, dz["ransac_thresh"], dz["ransac_confidence"])
+    if H is None or int(mask.sum()) < dz["min_matches"]:
+        return None
+    return H, int(mask.sum()), [good[k] for k in range(len(good)) if mask.ravel()[k]]
+
+
+def build_or_load_vocabulary(cfg, dz, feats_by_idx):
+    vocab_path = os.path.join(cfg["register_results_dir"], "bow_vocabulary.npz")
+    if os.path.exists(vocab_path) and not dz.get("rebuild_vocabulary", False):
+        return np.load(vocab_path)["centers"]
+    rng = np.random.default_rng(0)
+    idxs = list(feats_by_idx.keys())
+    rng.shuffle(idxs)
+    chunks, total = [], 0
+    for idx in idxs:
+        d = feats_by_idx[idx][1]
+        if len(d):
+            chunks.append(d)
+            total += len(d)
+        if total >= dz["vocab_sample_descriptors"]:
+            break
+    all_descs = np.concatenate(chunks, axis=0).astype(np.float32)
+    if len(all_descs) > dz["vocab_sample_descriptors"]:
+        sel = rng.choice(len(all_descs), dz["vocab_sample_descriptors"], replace=False)
+        all_descs = all_descs[sel]
+    n_words = min(dz["n_words"], max(2, len(all_descs) // 10))
+    print(f"Building BoW vocabulary: {n_words} words from {len(all_descs):,} descriptors...")
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 20, 1e-4)
+    _, _, centers = cv2.kmeans(all_descs, n_words, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+    np.savez(vocab_path, centers=centers)
+    return centers
+
+
+def compute_bow_vectors(feats_by_idx, vocab):
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    idxs = list(feats_by_idx.keys())
+    n_words = len(vocab)
+    raw = {}
+    for idx in idxs:
+        descs = feats_by_idx[idx][1]
+        hist = np.zeros(n_words, dtype=np.float32)
+        if len(descs):
+            for m in matcher.match(descs.astype(np.float32), vocab):
+                hist[m.trainIdx] += 1
+        raw[idx] = hist
+    doc_freq = np.zeros(n_words, dtype=np.float64)
+    for idx in idxs:
+        doc_freq += (raw[idx] > 0)
+    idf = np.log((len(idxs) + 1.0) / (doc_freq + 1.0))
+    vectors = {}
+    for idx in idxs:
+        v = raw[idx] * idf
+        norm = np.linalg.norm(v)
+        vectors[idx] = (v / norm) if norm > 0 else v
+    return vectors
+
+
+def bow_top_candidates(vectors, top_m):
+    idxs = list(vectors.keys())
+    mat = np.stack([vectors[i] for i in idxs])
+    sims = mat @ mat.T
+    np.fill_diagonal(sims, -1.0)
+    out = {}
+    for row, idx in enumerate(idxs):
+        order = np.argsort(sims[row])[::-1][:top_m]
+        out[idx] = [idxs[o] for o in order if sims[row, o] > 0]
+    return out
+
+
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
 def _match_status_path(cfg):
     return os.path.join(cfg["register_results_dir"], "rgb_matches.csv")
 
@@ -60,6 +190,30 @@ def _inlier_matches_path(cfg):
     return os.path.join(cfg["register_results_dir"], "rgb_inlier_matches.csv")
 
 
+<<<<<<< HEAD
+=======
+def load_pair_status(cfg):
+    path = _match_status_path(cfg)
+    status = {}
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                status[(row["image_a"], row["image_b"])] = (row["verified"] == "1", int(row["inliers"]))
+    return status
+
+
+def append_pair_status(cfg, rows):
+    path = _match_status_path(cfg)
+    is_new = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["image_a", "image_b", "verified", "inliers"])
+        for a, b, v, inl in rows:
+            writer.writerow([a, b, int(v), inl])
+
+
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
 def append_inlier_matches(cfg, a, b, inlier_pairs):
     path = _inlier_matches_path(cfg)
     is_new = not os.path.exists(path)
@@ -104,6 +258,7 @@ def _composite(base, base_filled, add_bgr, add_alpha):
     return base, (base_filled | new_only)
 
 
+<<<<<<< HEAD
 # =====================================================================
 # GEOMETRIC FILL: for images with a real Agisoft visible pose, find
 # overlapping neighbors and compute the exact pixel mapping PURELY by
@@ -327,11 +482,17 @@ def geometric_fill(cfg, pairs, warped_dir, dense_dir, run_now):
     return handled
 
 
+=======
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
 def densify(cfg):
     dz = cfg["densify"]
     if not dz["enabled"]:
         return []
     dz = dict(dz)
+<<<<<<< HEAD
+=======
+    dz["work_size"] = cfg.get("calibrate_2d", {}).get("work_size", (640, 480))
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
 
     pairs = find_pairs(cfg["visible_dir"], cfg["thermal_dir"])
     by_idx = {idx: (v, t) for idx, v, t in pairs}
@@ -357,6 +518,7 @@ def densify(cfg):
     if not run_now:
         return []
 
+<<<<<<< HEAD
     from pipeline_opensfm_import import import_opensfm_tracks
     import_opensfm_tracks(cfg)
 
@@ -402,23 +564,91 @@ def densify(cfg):
         for im in all_matched_images:
             img_groups.setdefault(uf_img.find(im), set()).add(im)
         component_sizes = sorted((len(g) for g in img_groups.values()), reverse=True)
+=======
+    detector, norm_type = build_feature_detector(dz)
+    print(f"1) detect_features: {dz['feature_detector'].upper()} on {len(have_warped)} images...")
+    feats = {idx: extract_features(idx, by_idx[idx][0], detector, cfg, dz) for idx in have_warped}
+
+    print("2) BoW candidate selection...")
+    vocab = build_or_load_vocabulary(cfg, dz, feats)
+    bow_vectors = compute_bow_vectors(feats, vocab)
+    candidates_by_idx = bow_top_candidates(bow_vectors, dz["top_m_candidates"])
+
+    print("3) match_features (new pairs only)...")
+    pair_status = load_pair_status(cfg)
+    involved = set(run_now)
+    for idx in run_now:
+        involved.update(candidates_by_idx.get(idx, []))
+
+    status_rows, n_new_verified = [], 0
+    for idx in involved:
+        for nidx in candidates_by_idx.get(idx, []):
+            key = (min(idx, nidx), max(idx, nidx))
+            if key in pair_status:
+                continue
+            a, b = key
+            result = match_pair(feats[a][0], feats[a][1], feats[b][0], feats[b][1], norm_type, dz)
+            if result is None:
+                pair_status[key] = (False, 0)
+                status_rows.append((a, b, False, 0))
+                continue
+            H, inliers, inlier_pairs = result
+            pair_status[key] = (True, inliers)
+            status_rows.append((a, b, True, inliers))
+            append_inlier_matches(cfg, a, b, inlier_pairs)
+            n_new_verified += 1
+    if status_rows:
+        append_pair_status(cfg, status_rows)
+    print(f"   {len(status_rows)} new pairs attempted ({n_new_verified} verified) | "
+          f"{sum(1 for v,_ in pair_status.values() if v)} verified total")
+
+    # ---- graph connectivity diagnostic: is the match graph one big
+    # connected piece, or fragmented into small isolated clusters (which
+    # would explain poor coverage even with plenty of accumulated data,
+    # since images in different pieces can never reach each other) ----
+    uf_img = UnionFind()
+    all_matched_images = set()
+    for (a, b), (verified, _) in pair_status.items():
+        if verified:
+            uf_img.union(a, b)
+            all_matched_images.add(a)
+            all_matched_images.add(b)
+    img_groups = {}
+    for im in all_matched_images:
+        img_groups.setdefault(uf_img.find(im), set()).add(im)
+    component_sizes = sorted((len(g) for g in img_groups.values()), reverse=True)
+    if component_sizes:
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
         shown = component_sizes[:10]
         print(f"   Match graph connectivity: {len(component_sizes)} connected component(s) "
               f"over {len(all_matched_images)} images | sizes: {shown}"
               + ("..." if len(component_sizes) > 10 else ""))
         if len(component_sizes) > 1:
             print(f"   [WARN] FRAGMENTED into {len(component_sizes)} pieces -- images in different "
+<<<<<<< HEAD
                   f"pieces cannot fill each other no matter how much data has accumulated elsewhere.")
 
     uf = UnionFind()
     for a, b, kp_a, kp_b in inlier_rows:
+=======
+                  f"pieces cannot fill each other no matter how much data has accumulated elsewhere. "
+                  f"Raise densify.top_m_candidates to give more images a chance at a verified edge "
+                  f"into the largest component ({component_sizes[0]} images).")
+
+    uf = UnionFind()
+    for a, b, kp_a, kp_b in load_all_inlier_matches(cfg):
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
         uf.union((a, kp_a), (b, kp_b))
     groups = {}
     for node in list(uf.parent):
         groups.setdefault(uf.find(node), []).append(node)
     tracks = [obs for obs in groups.values() if len({im for im, _ in obs}) >= dz["min_track_len"]]
     tracks_path = export_tracks_csv(cfg, tracks)
+<<<<<<< HEAD
     print(f"   {len(tracks)} tracks, exported to {tracks_path}")
+=======
+    print(f"4) create_tracks: {len(tracks)} tracks, exported to {tracks_path}")
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
 
     tracks_by_image = {}
     for tid, obs in enumerate(tracks):
@@ -442,7 +672,11 @@ def densify(cfg):
         H, mask = estimate_homography_robust(src, dst, dz["ransac_thresh"], dz["ransac_confidence"])
         return (None, 0) if H is None else (H, int(mask.sum()))
 
+<<<<<<< HEAD
     print("3) filling targets...")
+=======
+    print("5) filling targets...")
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
     n_ok, n_err = 0, 0
     for idx in run_now:
         try:
@@ -468,12 +702,20 @@ def densify(cfg):
                     scored.append((nidx, H, inl))
             scored.sort(key=lambda t: -t[2])
 
+<<<<<<< HEAD
             for nidx, H_full, inl in scored:
                 # H_full already maps neighbor-native -> target-native directly:
                 # feats[...] are native-resolution points (opensfm_import writes
                 # denormalized pixel coords using each image's real width/height),
                 # so the fitted homography needs no further rescaling here.
                 n_bgr, n_alpha = load_warped_thermal_bgra(os.path.join(warped_dir, f"{nidx}_T_warped.png"))
+=======
+            for nidx, H_n_to_target, inl in scored:
+                n_bgr, n_alpha = load_warped_thermal_bgra(os.path.join(warped_dir, f"{nidx}_T_warped.png"))
+                nvpath, _ = by_idx[nidx]
+                neighbor_shape = load_color(nvpath).shape
+                H_full = full_res_matrix(H_n_to_target, neighbor_shape, visible_target.shape, dz["work_size"])
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
                 out_size = (visible_target.shape[1], visible_target.shape[0])
                 warped_bgr = cv2.warpPerspective(n_bgr, H_full, out_size, flags=cv2.INTER_NEAREST)
                 warped_alpha = cv2.warpPerspective(n_alpha, H_full, out_size, flags=cv2.INTER_NEAREST, borderValue=0)
@@ -488,6 +730,11 @@ def densify(cfg):
             n_err += 1
             print(f"[{idx}] ERROR: {e}")
 
+<<<<<<< HEAD
     print(f"\nThis run: {len(handled_geometrically)} geometric, {n_ok} track-based ok, {n_err} error, "
           f"{len(handled_geometrically) + len(run_now)} total")
     return list(handled_geometrically) + run_now
+=======
+    print(f"\nThis run: {n_ok} ok, {n_err} error, {len(run_now)} total")
+    return run_now
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da

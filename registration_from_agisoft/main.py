@@ -41,4 +41,8 @@ def main(cfg=CONFIG):
 
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     main()
+=======
+    main()
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da

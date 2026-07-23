@@ -6,12 +6,21 @@ place, run `python main.py`.
 
 CONFIG = dict(
     # ---- Step 1: organize ----
+<<<<<<< HEAD
     source_dir=r"E:\drone_090426\Raw_images\DCIM_1\full_flight1_zone1",
     visible_dir=r"E:\drone_090426\Raw_images\DCIM_1\full_flight1_zone1\visible",
     thermal_dir=r"E:\drone_090426\Raw_images\DCIM_1\full_flight1_zone1\thermal",
     register_results_dir=r"E:\drone_090426\Raw_images\DCIM_1\full_flight1_zone1\register_results",
     copy_mode="copy",               # "copy" (safe, keeps originals) or "move"
     fresh_start=True,              # True = wipe visible_dir/thermal_dir/register_results_dir first
+=======
+    source_dir=r"E:\drone_090426\Raw_images\DCIM_1\DJI_202604090901_001_zoneseuils1",
+    visible_dir=r"E:\drone_090426\Raw_images\DCIM_1\DJI_202604090901_001_zoneseuils1\visible",
+    thermal_dir=r"E:\drone_090426\Raw_images\DCIM_1\DJI_202604090901_001_zoneseuils1\thermal",
+    register_results_dir=r"E:\drone_090426\Raw_images\DCIM_1\DJI_202604090901_001_zoneseuils1\register_results",
+    copy_mode="copy",               # "copy" (safe, keeps originals) or "move"
+    fresh_start=False,              # True = wipe visible_dir/thermal_dir/register_results_dir first
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
     min_prefix_fallback_len=6,
     resolution_threshold_px=None,   # None = auto-detect
     dry_run=False,
@@ -29,6 +38,7 @@ CONFIG = dict(
                              # matches), which is what pipeline_calibrate_2d.py is for.
 
     agisoft=dict(
+<<<<<<< HEAD
         xml_path=r"E:\agisoft auto scripts\from agisoft\full_flight1 camera.xml",
         thermal_hfov_deg=None,   # Fallback ONLY used if the thermal image's own EXIF has no usable
                                   # focal-length tags at all (check the "[EXIF debug]" log line to see
@@ -44,6 +54,14 @@ CONFIG = dict(
                           # LAS point cloud's CRS -- the chunk's own <reference> WKT is WGS84/EPSG:4326,
                           # that is NOT what you exported the LAS in. Check the LAS file's .prj sidecar
                           # (same folder, same name as the .las) or your export dialog's CRS setting.
+=======
+        xml_path=r"E:\drone_090426\full_flight1_camera.xml",   # <-- CHANGE THIS to your camera XML path
+                                                                  # (File > Export > Export Cameras > "Agisoft XML")
+        dem_epsg=None,   # EPSG code of your LAS point cloud's CRS (needed to query the DEM in
+                          # pipeline_dem.py -- the chunk's own <reference> WKT is WGS84/EPSG:4326,
+                          # NOT necessarily what you exported the LAS in). Check the LAS file's
+                          # .prj sidecar or your export settings; None = DEM path stays disabled.
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
     ),
 
     # ---- OPTIONAL: real terrain height from an Agisoft/any LAS point cloud
@@ -52,11 +70,21 @@ CONFIG = dict(
     # Safe to leave enabled: falls back to the flat plane automatically if
     # the coordinate-system check fails -- READ THE LOG either way.
     dem=dict(
+<<<<<<< HEAD
         enabled=True,
         las_path=r"E:\agisoft auto scripts\from agisoft\full_flight1_zone1_v_Chunk_1_points.las",
         resolution_m=0.5,            # DSM grid cell size (meters) -- finer = more accurate but slower
         epsg=None,                   # NOT used with pose_source="agisoft" -- that path reads
                                       # agisoft.dem_epsg above instead. Only relevant for pose_source="opensfm".
+=======
+        enabled=False,               # set True once you have a LAS file to try
+        las_path=r"PATH\TO\your_agisoft_pointcloud.las",
+        resolution_m=0.5,            # DSM grid cell size (meters) -- finer = more accurate but slower
+        epsg=None,                   # UTM EPSG code to convert the SfM reconstruction into. None =
+                                      # auto-detect from the reconstruction's own longitude -- verify
+                                      # this actually matches the LAS file's real CRS (check the printed
+                                      # "Auto-detected UTM zone" line against your Agisoft project settings).
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
     ),
 
     # ---- Step 2b (FALLBACK): 2D self-calibration ----
@@ -99,6 +127,7 @@ CONFIG = dict(
 
     # ---- Step 4: densify (BoW + feature tracks, fills gaps using overlap
     # between NEIGHBORING visible frames) ----
+<<<<<<< HEAD
     # ---- OPTIONAL: reuse an already-completed OpenSfM/ODM run's own
     # features + matches instead of recomputing them in densify() below.
     # Populates the SAME cache files pipeline_densify.py's SIFT path would
@@ -121,6 +150,31 @@ CONFIG = dict(
         ransac_confidence=0.999,
         min_matches=15,           # minimum shared track points required to trust a homography fit
         min_track_len=2,          # a track needs to span at least this many images to be kept
+=======
+    densify=dict(
+        enabled=True,
+        feature_detector="sift",
+        n_features=4000,
+        save_features=True,
+        n_words=750,
+        vocab_sample_descriptors=200000,
+        rebuild_vocabulary=False,
+        top_m_candidates=40,          # per image, how many of the most visually-similar OTHER images
+                                       # become match candidates. Consecutive along-track frames look
+                                       # almost identical (captured 1-2s apart, huge overlap) and rank
+                                       # as MOST similar by BoW -- with a small M they can crowd out the
+                                       # images that would actually extend coverage, fragmenting the
+                                       # match graph into small isolated clusters instead of one large
+                                       # connected one. A bad BoW candidate just fails RANSAC and gets
+                                       # dropped, so a larger M costs match-time, not correctness --
+                                       # check the "Match graph connectivity" log line; if it still
+                                       # reports more than one component, raise this further.
+        match_ratio=0.75,
+        ransac_thresh=3.0,
+        ransac_confidence=0.999,
+        min_matches=15,
+        min_track_len=2,
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
         max_pairs_per_run=None,
         skip_already_processed=True,
     ),

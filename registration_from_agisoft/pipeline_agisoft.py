@@ -53,7 +53,10 @@ row-major vs column-major matrix reading is still a place a mistake could
 hide. Read that printed RMSE before trusting the result.
 """
 
+<<<<<<< HEAD
 import os
+=======
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
 import xml.etree.ElementTree as ET
 
 import cv2
@@ -79,6 +82,7 @@ def get_camera_intrinsics_from_exif(path):
     fallback OpenSfM/ODM themselves use when no calibration file is
     available: focal_px = FocalLengthIn35mm * max(w,h) / 36.0), falling
     back to FocalLength(mm) + FocalPlaneXResolution. Returns None if
+<<<<<<< HEAD
     neither is available.
 
     IMPORTANT: FocalLength/FocalLengthIn35mmFilm/FocalPlane* are stored in
@@ -87,10 +91,14 @@ def get_camera_intrinsics_from_exif(path):
     get_ifd(0x8825) elsewhere in this pipeline. A plain exif.get(tag) on
     the base object silently returns None for these regardless of whether
     the camera actually wrote them."""
+=======
+    neither is available."""
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
     try:
         with Image.open(path) as im:
             w, h = im.size
             exif = im.getexif()
+<<<<<<< HEAD
             try:
                 exif_ifd = exif.get_ifd(0x8769)
             except (KeyError, AttributeError):
@@ -106,11 +114,21 @@ def get_camera_intrinsics_from_exif(path):
         focal_mm = _get(_TAG_FOCAL_LENGTH)
         fpx_res = _get(_TAG_FPX_RES)
         fpx_unit = _get(_TAG_FPX_UNIT)
+=======
+        focal_35 = exif.get(_TAG_FOCAL_LENGTH_35MM)
+        if focal_35:
+            focal_px = float(focal_35) * max(w, h) / 36.0
+            return dict(fx=focal_px, fy=focal_px, cx=w / 2.0, cy=h / 2.0, width=w, height=h, source="35mm-equivalent")
+        focal_mm = exif.get(_TAG_FOCAL_LENGTH)
+        fpx_res = exif.get(_TAG_FPX_RES)
+        fpx_unit = exif.get(_TAG_FPX_UNIT)
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
         if focal_mm and fpx_res:
             unit_mm = {2: 25.4, 3: 10.0}.get(int(fpx_unit) if fpx_unit else 2, 25.4)
             sensor_width_mm = w / (float(fpx_res) / unit_mm)
             focal_px = float(focal_mm) * w / sensor_width_mm
             return dict(fx=focal_px, fy=focal_px, cx=w / 2.0, cy=h / 2.0, width=w, height=h, source="focal-plane-resolution")
+<<<<<<< HEAD
         print(f"[EXIF debug] {path}: no usable focal tags found "
               f"(FocalLengthIn35mmFilm={focal_35}, FocalLength={focal_mm}, FocalPlaneXResolution={fpx_res}) "
               f"-- set agisoft.thermal_hfov_deg manually instead.")
@@ -128,6 +146,13 @@ def K_from_hfov(hfov_deg, width, height):
     return np.array([[focal_px, 0, width / 2.0], [0, focal_px, height / 2.0], [0, 0, 1]], dtype=np.float64)
 
 
+=======
+        return None
+    except Exception:
+        return None
+
+
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
 def K_from_intrinsics(intr):
     return np.array([[intr["fx"], 0, intr["cx"]], [0, intr["fy"], intr["cy"]], [0, 0, 1]], dtype=np.float64)
 
@@ -334,11 +359,18 @@ def validate_agisoft_poses(poses, visible_paths_by_label, ground_z_ecef_hint=Non
 
 
 def load_agisoft_poses(cfg, visible_paths_by_label):
+<<<<<<< HEAD
     """Parse the XML, build ECEF poses, sanity-check, return
     {original_label: pose_dict} -- keyed by the ORIGINAL DJI filenames the
     XML itself uses, NOT organize()'s renamed files. Use
     load_organized_visible_poses() below instead unless you specifically
     need this raw, un-bridged form."""
+=======
+    """Main entry point: parse the XML, build ECEF poses, sanity-check,
+    return {label: pose_dict} -- ready for pipeline_sfm.warp_thermal_via_sfm
+    (same {K,R,t,C} shape, ECEF meters instead of OpenSfM's local frame --
+    doesn't matter, both are just self-consistent 3D Cartesian frames)."""
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
     ag = cfg["agisoft"]
     sensors, cameras, chunk = parse_agisoft_xml(ag["xml_path"])
     poses = build_agisoft_poses(sensors, cameras, chunk)
@@ -346,6 +378,7 @@ def load_agisoft_poses(cfg, visible_paths_by_label):
     return poses
 
 
+<<<<<<< HEAD
 def load_organized_visible_poses(cfg, pairs):
     """Full chain: parse the Agisoft XML, bridge ORIGINAL DJI filenames (what
     the XML labels use) to organize()'s renamed files via file_mapping.csv,
@@ -369,6 +402,8 @@ def load_organized_visible_poses(cfg, pairs):
     return visible_poses
 
 
+=======
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
 # =====================================================================
 # THERMAL POSES: Agisoft only ever processed visible, so thermal has no
 # pose of its own -- derive it as (visible pose) + (rig transform),

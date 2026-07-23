@@ -213,4 +213,8 @@ def validate_dem_alignment(transform, visible_poses, dem, max_xy_error_m=100.0):
 
     aligned = in_bbox.mean() > 0.8
     print(f"  -> {'ALIGNED, DEM path usable' if aligned else 'NOT ALIGNED -- DEM path will be skipped, falling back to flat-plane'}")
+<<<<<<< HEAD
     return aligned
+=======
+    return aligned
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da

@@ -79,4 +79,8 @@ def load_warped_thermal_bgra(path):
         raise FileNotFoundError(f"Could not read: {path}")
     if img.ndim != 3 or img.shape[2] != 4:
         raise ValueError(f"{path} has no alpha channel (shape={img.shape}) -- regenerate it via apply().")
+<<<<<<< HEAD
     return img[:, :, :3], img[:, :, 3]
+=======
+    return img[:, :, :3], img[:, :, 3]
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da

@@ -276,21 +276,31 @@ def warp_thermal_via_2d(visible_color, thermal_color, M_work, work_size, tps, di
     out_size = (visible_color.shape[1], visible_color.shape[0])
     k_thermal, dist_center_work, dist_scale_work = distortion if distortion else (0.0, None, None)
 
+<<<<<<< HEAD
     # Build the mask from the TRUE original image, before any processing --
     # every geometric step below (undistortion, homography, TPS) must carry
     # this mask through it too, or padding introduced by that step gets
     # silently marked "valid" and composited in as if it were real data.
     src_mask = np.full(thermal_color.shape[:2], 255, dtype=np.uint8)
 
+=======
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
     if k_thermal:
         map_x_u, map_y_u = build_undistort_map(work_size, thermal_color.shape, dist_center_work, k_thermal, dist_scale_work)
         thermal_color = cv2.remap(thermal_color, map_x_u, map_y_u, interpolation=cv2.INTER_NEAREST,
                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+<<<<<<< HEAD
         src_mask = cv2.remap(src_mask, map_x_u, map_y_u, interpolation=cv2.INTER_NEAREST,
                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
     M_full = full_res_matrix(M_work, thermal_color.shape, visible_color.shape, work_size)
     thermal_warped = cv2.warpPerspective(thermal_color, M_full, out_size, flags=cv2.INTER_NEAREST)
+=======
+
+    M_full = full_res_matrix(M_work, thermal_color.shape, visible_color.shape, work_size)
+    thermal_warped = cv2.warpPerspective(thermal_color, M_full, out_size, flags=cv2.INTER_NEAREST)
+    src_mask = np.full(thermal_color.shape[:2], 255, dtype=np.uint8)
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
     valid_mask = cv2.warpPerspective(src_mask, M_full, out_size, flags=cv2.INTER_NEAREST, borderValue=0)
 
     if tps is not None:

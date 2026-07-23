@@ -56,6 +56,7 @@ def _get_agisoft_thermal_poses(cfg, all_pairs, visible_poses, M_work, work_size)
 
     sample_tpath = all_pairs[len(all_pairs) // 2][2]
     intr_t = pag.get_camera_intrinsics_from_exif(sample_tpath)
+<<<<<<< HEAD
     if intr_t is not None:
         K_thermal_native = pag.K_from_intrinsics(intr_t)
         native_wh_t = (intr_t["width"], intr_t["height"])
@@ -73,6 +74,14 @@ def _get_agisoft_thermal_poses(cfg, all_pairs, visible_poses, M_work, work_size)
         print(f"Using manual thermal_hfov_deg={hfov} (EXIF had nothing usable) -> "
               f"fx=fy={K_thermal_native[0,0]:.1f}px for {native_wh_t[0]}x{native_wh_t[1]}")
 
+=======
+    if intr_t is None:
+        print("[WARN] Could not get thermal EXIF intrinsics -- rig derivation skipped, using 2D for everyone.")
+        return {}
+
+    K_thermal_native = pag.K_from_intrinsics(intr_t)
+    native_wh_t = (intr_t["width"], intr_t["height"])
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
     K_visible_work = _scale_K(K_visible_native, native_wh_v, work_size)
     K_thermal_work = _scale_K(K_thermal_native, native_wh_t, work_size)
 
@@ -180,9 +189,31 @@ def apply_pipeline(cfg):
 
     if pose_source == "agisoft" and cfg.get("agisoft", {}).get("xml_path"):
         import pipeline_agisoft as pag
+<<<<<<< HEAD
         from pipeline_calibrate_2d import calibrate_2d
         try:
             visible_poses = pag.load_organized_visible_poses(cfg, pairs)
+=======
+        from pipeline_organize import load_original_name_to_organized_path
+        from pipeline_calibrate_2d import calibrate_2d
+        try:
+            # Agisoft XML camera labels are the ORIGINAL DJI filenames --
+            # organize() renamed the actual files on disk, so bridge the two
+            # via file_mapping.csv (original name -> organized path).
+            original_to_organized = load_original_name_to_organized_path(cfg)
+            visible_poses_by_original_name = pag.load_agisoft_poses(cfg, original_to_organized)
+            # re-key to ORGANIZED basenames so everything downstream (validation,
+            # rig derivation, the apply loop) matches how the rest of the
+            # pipeline (thermal_poses_3d, pairs, etc.) already identifies images
+            organized_to_original = {v: k for k, v in original_to_organized.items()}
+            visible_poses = {}
+            for _, vpath, _ in pairs:
+                orig_name = organized_to_original.get(vpath)
+                if orig_name and orig_name in visible_poses_by_original_name:
+                    visible_poses[os.path.basename(vpath)] = visible_poses_by_original_name[orig_name]
+            print(f"Matched {len(visible_poses)}/{len(visible_poses_by_original_name)} Agisoft-aligned "
+                  f"cameras to organized files via file_mapping.csv")
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
 
             print("\nCalibrating 2D homography (needed both as the fallback AND to derive the rig)...")
             M_work, work_size, tps, distortion = calibrate_2d(cfg)

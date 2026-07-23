@@ -297,4 +297,8 @@ def warp_thermal_via_sfm(visible_color, thermal_color, visible_pose, thermal_pos
                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     th, tw = thermal_color.shape[:2]
     valid = ((map_x >= 0) & (map_x < tw) & (map_y >= 0) & (map_y < th)).astype(np.uint8) * 255
+<<<<<<< HEAD
     return thermal_warped, valid
+=======
+    return thermal_warped, valid
+>>>>>>> 44a9db3ed608ee77b9e0e1f2d8447c2372a3d5da
