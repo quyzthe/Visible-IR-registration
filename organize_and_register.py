@@ -1,6 +1,6 @@
 """
 Organize a raw DJI DCIM mission folder into visible/ + thermal/ subfolders,
-then run the batch visible-thermal registration pipeline.
+then calibrate and apply visible-thermal registration.
 
 STEP 1 -- ORGANIZE
 -------------------
@@ -47,6 +47,11 @@ solid black output). Instead:
       `max_pairs_per_run` / `skip_already_processed` still apply here so
       you can process the dataset incrementally.
 
+STEP 3 (densifying gaps using neighboring visible-frame overlap) now lives
+in its own script, step3_densify.py -- it only READS this script's outputs
+(visible_dir/thermal_dir/register_results/warped_thermal), so it never
+needs Step 1/2 to run again once warped_thermal exists.
+
 Run with: python organize_and_register.py
 """
 
@@ -60,10 +65,6 @@ import cv2
 import torch
 import kornia.feature as KF
 import numpy as np
-
-import gzip
-import pickle
-from collections import defaultdict
 
 try:
     from PIL import Image
@@ -155,64 +156,8 @@ CONFIG = dict(
     # ---- Step 2b: apply calibrated transform to every pair (color, no LoFTR) ----
     save_warped_thermal=True,
     save_overlay=True,
-    max_pairs_per_run=None,          # None = process everything found; int = only this many NEW pairs this run
+    max_pairs_per_run=1,           # None = process everything found; int = only this many NEW pairs this run
     skip_already_processed=True,   # skip pairs that already have an overlay output on disk
-
-    # ---- Step 3: densify -- fill gaps using overlap between NEIGHBORING visible
-    # frames (same-modality RGB-RGB matching, far more reliable than cross-modal).
-    # Reuses each neighbor's already-computed warped_thermal (Step 2b), projected
-    # into the target frame via the visible(neighbor)->visible(target) homography.
-    densify=dict(
-        enabled=True,
-
-        # ---- 1) detect_features ----
-        feature_detector="sift",     # "sift" (default -- what OpenSfM/ODM use by default, better in
-                                      # low-texture regions) or "orb" (faster, no GPU/patent concerns)
-        n_features=4000,             # max keypoints per image
-        save_features=True,          # cache to register_results/rgb_features/<idx>.npz -- computed
-                                      # ONCE per image EVER (across the whole warped_thermal pool, not
-                                      # just this run's targets), reused by every future run
-
-        # ---- 2) GLOBAL candidate selection via Bag-of-Visual-Words retrieval ----
-        # (COLMAP/ORB-SLAM/OpenSfM-style "vocabulary tree" match-pair selection --
-        # replaces GPS/index proximity entirely; a candidate pair is chosen by
-        # VISUAL similarity across the WHOLE image pool, not local position)
-        n_words=750,                 # vocabulary size (visual words) -- a single-mission dataset with
-                                      # fairly homogeneous terrain doesn't need a huge vocabulary
-        vocab_sample_descriptors=200000,  # cap on descriptors sampled to build the vocabulary (kmeans)
-        rebuild_vocabulary=False,    # True = rebuild register_results/bow_vocabulary.npz from scratch
-        top_m_candidates=15,         # per image, how many of the most visually-similar OTHER images
-                                      # become match candidates. A bad candidate (visually similar but
-                                      # not actually overlapping, e.g. repeated vegetation) just fails
-                                      # RANSAC verification below and gets dropped -- costs a little
-                                      # compute, not correctness.
-
-        # ---- 3) match_features ----
-        match_ratio=0.75,            # Lowe's ratio test threshold
-        ransac_thresh=3.0,
-        ransac_confidence=0.999,
-        min_matches=15,
-
-        # ---- ODM / OpenSfM (reuse precomputed RGB features + matches) ----
-        odm=dict(
-            opensfm_dir=r"E:\drone_090426\Raw_images\DCIM_1\feed_odm\opensfm",
-        ),
-
-        # ---- 4) create_tracks ----
-        min_track_len=2,             # keep tracks observed in at least this many images
-
-        # ---- 5) fill ----
-        mask_dilate_px=3,            # grow each source's valid-region mask by this many px before
-                                      # compositing -- warpPerspective+INTER_NEAREST leaves ragged/gappy
-                                      # mask edges, and two independently-fit homographies never agree
-                                      # on the boundary to the pixel; a small overlap beats a real gap
-        feather_px=15,               # soft-blend width (px, native resolution) at the boundary where
-                                      # a new source fills in -- reduces visible seams between sources
-                                      # captured at different times/positions. 0 = hard cutoff, no blend.
-
-        max_pairs_per_run=None,       # separate cap -- this stage does its own feature matching too
-        skip_already_processed=True,
-    ),
 )
 
 IMG_EXTS = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
@@ -521,7 +466,9 @@ def load_color(path):
 # switch, not threaded through every call site) so calibration and apply
 # always see identical geometry -- if that were inconsistent between the
 # two stages it would silently corrupt the fit, which is exactly what
-# "never reduce accuracy" means to guard against here.
+# "never reduce accuracy" means to guard against here. OFF by default
+# (_DEWARP_ENABLED=False): flip it on directly in code if the thermal
+# sensor's own XMP DewarpData should be applied.
 # =====================================================================
 
 _DEWARP_ENABLED = False
@@ -1140,385 +1087,6 @@ def apply_calibration(cfg, M_work, work_size, tps=None, distortion=None):
     print(f"\nThis run: {n_ok} ok, {n_err} error, {len(run_now)} total")
     return run_now
 
-# =====================================================================
-# GLOBAL CANDIDATE SELECTION: Bag-of-Visual-Words retrieval
-# ("vocabulary tree" match-pair selection, as used in COLMAP/ORB-SLAM/
-# OpenSfM's no-GPS fallback -- see e.g. Schonberger et al., or the UAV-
-# specific "Leveraging vocabulary tree for simultaneous match pair
-# selection..." ISPRS 2022). Every image's descriptors are quantized
-# against a small shared vocabulary into ONE compact TF-IDF histogram;
-# candidate pairs are just the images with the closest histograms --
-# this is a GLOBAL search over every image, not restricted to a local
-# GPS/index neighborhood, which is exactly what was failing before.
-# =====================================================================
-
-def build_or_load_vocabulary(cfg, feats_by_idx):
-    dz = cfg["densify"]
-    vocab_path = os.path.join(cfg["register_results_dir"], "bow_vocabulary.npz")
-    if os.path.exists(vocab_path) and not dz.get("rebuild_vocabulary", False):
-        return np.load(vocab_path)["centers"]
-
-    rng = np.random.default_rng(0)
-    idxs = list(feats_by_idx.keys())
-    rng.shuffle(idxs)
-    chunks, total = [], 0
-    for idx in idxs:
-        d = feats_by_idx[idx][1]
-        if len(d):
-            chunks.append(d)
-            total += len(d)
-        if total >= dz["vocab_sample_descriptors"]:
-            break
-    all_descs = np.concatenate(chunks, axis=0).astype(np.float32)
-    if len(all_descs) > dz["vocab_sample_descriptors"]:
-        sel = rng.choice(len(all_descs), dz["vocab_sample_descriptors"], replace=False)
-        all_descs = all_descs[sel]
-
-    n_words = min(dz["n_words"], max(2, len(all_descs) // 10))
-    print(f"Building BoW vocabulary: {n_words} words from {len(all_descs):,} sampled descriptors...")
-    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 20, 1e-4)
-    _, _, centers = cv2.kmeans(all_descs, n_words, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
-    np.savez(vocab_path, centers=centers)
-    return centers
-
-
-def compute_bow_vectors(feats_by_idx, vocab):
-    """TF-IDF weighted, L2-normalized BoW histogram per image. Pairwise
-    cosine similarity is then just the dot product of these vectors."""
-    matcher = cv2.BFMatcher(cv2.NORM_L2)
-    idxs = list(feats_by_idx.keys())
-    n_words = len(vocab)
-
-    raw = {}
-    for idx in idxs:
-        descs = feats_by_idx[idx][1]
-        hist = np.zeros(n_words, dtype=np.float32)
-        if len(descs):
-            for m in matcher.match(descs.astype(np.float32), vocab):
-                hist[m.trainIdx] += 1
-        raw[idx] = hist
-
-    doc_freq = np.zeros(n_words, dtype=np.float64)
-    for idx in idxs:
-        doc_freq += (raw[idx] > 0)
-    idf = np.log((len(idxs) + 1.0) / (doc_freq + 1.0))
-
-    vectors = {}
-    for idx in idxs:
-        v = raw[idx] * idf
-        norm = np.linalg.norm(v)
-        vectors[idx] = (v / norm) if norm > 0 else v
-    return vectors
-
-
-def bow_top_candidates(vectors, top_m):
-    """idx -> list of the top_m most visually-similar OTHER images
-    (cosine similarity via dot product, vectors are already L2-normalized)."""
-    idxs = list(vectors.keys())
-    mat = np.stack([vectors[i] for i in idxs])  # (N, n_words)
-    sims = mat @ mat.T
-    np.fill_diagonal(sims, -1.0)
-    out = {}
-    for row, idx in enumerate(idxs):
-        order = np.argsort(sims[row])[::-1][:top_m]
-        out[idx] = [idxs[o] for o in order if sims[row, o] > 0]
-    return out
-
-
-# =====================================================================
-# STEP 3: DENSIFY -- ODM/OpenSfM-style pipeline
-#   1) detect_features : SIFT keypoints+descriptors, ONCE per image, cached
-#   2) BoW candidate selection : GLOBAL visual-similarity retrieval (not
-#      GPS/index-local) picks which pairs are worth attempting to match
-#   3) match_features   : FLANN/BFMatcher + Lowe ratio test + homography
-#      RANSAC on those candidate pairs (false-positive BoW candidates --
-#      e.g. two unrelated patches of similar-looking vegetation -- simply
-#      fail RANSAC verification here and are dropped, same as any SfM
-#      pipeline using retrieval-based candidates)
-#   4) create_tracks     : Union-Find links verified matches across ALL
-#      pairs into tracks -- a track is one physical feature seen in N
-#      images, including images never directly matched to each other
-#   5) fill each target using every image reachable via a SHARED TRACK,
-#      fitting one direct homography per (source, target) from the pooled
-#      track correspondences, composited with soft feathering at the seams
-# =====================================================================
-# =====================================================================
-# STEP 3: DENSIFY USING ODM / OpenSfM FEATURES + MATCHES
-# No feature detection. No BF/FLANN matching.
-# =====================================================================
-
-def load_odm_features(opensfm_dir, image_name):
-    path = os.path.join(
-        opensfm_dir,
-        'features',
-        image_name + '.features.npz'
-    )
-    data = np.load(path)
-    return data['points']
-
-
-def load_odm_match_dict(opensfm_dir, image_name):
-    path = os.path.join(
-        opensfm_dir,
-        'matches',
-        image_name + '_matches.pkl.gz'
-    )
-    with gzip.open(path, 'rb') as f:
-        return pickle.load(f)
-
-
-def normalized_to_pixel(points_norm, width, height):
-    x = (points_norm[:, 0] + 0.5) * width
-    y = (points_norm[:, 1] + 0.5) * height
-    return np.column_stack([x, y]).astype(np.float32)
-
-
-def get_odm_correspondences(cfg, img_a, img_b):
-    opensfm_dir = cfg['odm']['opensfm_dir']
-    visible_dir = cfg['visible_dir']
-
-    # dùng ảnh trong visible_dir
-    path_a = os.path.join(visible_dir, img_a)
-    path_b = os.path.join(visible_dir, img_b)
-
-    im_a = cv2.imread(path_a)
-    im_b = cv2.imread(path_b)
-
-    if im_a is None or im_b is None:
-        print(f"[WARN] cannot read {img_a} or {img_b}")
-        return None, None
-
-    hA, wA = im_a.shape[:2]
-    hB, wB = im_b.shape[:2]
-
-    # features từ ODM
-    ptsA_norm = load_odm_features(opensfm_dir, img_a)
-    ptsB_norm = load_odm_features(opensfm_dir, img_b)
-
-    # matches từ ODM
-    mdict = load_odm_match_dict(opensfm_dir, img_a)
-
-    if img_b not in mdict:
-        return None, None
-
-    matches = mdict[img_b]
-
-    idxA = matches[:, 0]
-    idxB = matches[:, 1]
-
-    ptsA = normalized_to_pixel(ptsA_norm[idxA], wA, hA)
-    ptsB = normalized_to_pixel(ptsB_norm[idxB], wB, hB)
-
-    return ptsA, ptsB
-
-
-def estimate_rgb_homography_odm(cfg,
-                                img_src,
-                                img_dst,
-                                ransac_thresh=3.0,
-                                min_matches=15):
-
-    pts_src, pts_dst = get_odm_correspondences(
-        cfg,
-        img_src,
-        img_dst
-    )
-
-    if pts_src is None or len(pts_src) < min_matches:
-        return None
-
-    H, mask = cv2.findHomography(
-        pts_src,
-        pts_dst,
-        method=cv2.USAC_MAGSAC,
-        ransacReprojThreshold=ransac_thresh,
-        confidence=0.999,
-        maxIters=10000
-    )
-
-    if H is None:
-        return None
-
-    inliers = int(mask.sum())
-
-    print(f"    {img_src} -> {img_dst}: "
-          f"{len(pts_src)} matches, {inliers} inliers")
-
-    return H
-
-
-def build_odm_match_graph(opensfm_dir):
-    matches_dir = os.path.join(opensfm_dir, 'matches')
-
-    graph = defaultdict(set)
-
-    for fname in os.listdir(matches_dir):
-
-        if not fname.endswith('_matches.pkl.gz'):
-            continue
-
-        query_img = fname.replace('_matches.pkl.gz', '')
-
-        mdict = load_odm_match_dict(opensfm_dir, query_img)
-
-        for train_img in mdict.keys():
-            graph[query_img].add(train_img)
-            graph[train_img].add(query_img)
-
-    print(f"ODM graph: {len(graph)} images")
-    return graph
-
-
-def _mask_from_nonzero(img):
-    return np.any(img > 0, axis=2).astype(np.uint8) * 255
-
-
-def _feather_blend(dst, src, mask, feather_px):
-    if feather_px <= 0:
-        dst[mask > 0] = src[mask > 0]
-        return dst
-
-    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-    alpha = np.clip(dist / feather_px, 0.0, 1.0)[..., None]
-
-    blended = (
-        src.astype(np.float32) * alpha +
-        dst.astype(np.float32) * (1.0 - alpha)
-    ).astype(np.uint8)
-
-    out = dst.copy()
-    out[mask > 0] = blended[mask > 0]
-    return out
-
-
-def densify_with_odm(cfg):
-    dcfg = cfg['densify']
-    opensfm_dir = cfg['odm']['opensfm_dir']
-
-    warped_dir = os.path.join(
-        cfg['register_results_dir'],
-        'warped_thermal'
-    )
-
-    out_dir = os.path.join(
-        cfg['register_results_dir'],
-        'densified'
-    )
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    graph = build_odm_match_graph(opensfm_dir)
-
-    visible_files = sorted([
-        f for f in os.listdir(cfg['visible_dir'])
-        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
-    ])
-
-    print(f"Running ODM-guided densification on {len(visible_files)} images")
-
-    for vf in visible_files:
-
-        target_rgb = cv2.imread(
-            os.path.join(cfg['visible_dir'], vf)
-        )
-
-        if target_rgb is None:
-            continue
-
-        Ht, Wt = target_rgb.shape[:2]
-
-        idx_target = extract_id(vf)
-
-        target_warped_path = os.path.join(
-            warped_dir,
-            f'{idx_target}_thermal_warped.png'
-        )
-
-        if not os.path.exists(target_warped_path):
-            print(f"[SKIP] no warped thermal for {vf}")
-            continue
-
-        mosaic = cv2.imread(target_warped_path)
-
-        orig_target = None
-        features_dir = os.path.join(opensfm_dir, 'features')
-
-        for f in os.listdir(features_dir):
-            if f.endswith(vf + '.features.npz'):
-                orig_target = f[:-13]   # bỏ '.features.npz'
-                break
-
-        if orig_target is None:
-            print(f'[SKIP] cannot resolve ODM name for {vf}')
-            continue
-
-        neighbors = sorted(graph.get(orig_target, []))
-
-        print(f"[{vf}] {len(neighbors)} neighbors")
-
-        for src_vf in neighbors:
-
-            idx_src = extract_id(src_vf)
-
-            src_warped_path = os.path.join(
-                warped_dir,
-                f'{idx_src}_thermal_warped.png'
-            )
-
-            if not os.path.exists(src_warped_path):
-                continue
-
-            H_rgb = estimate_rgb_homography_odm(
-                cfg,
-                src_vf,
-                orig_target,
-                cfg['ransac_thresh'],
-                dcfg['min_matches']
-            )
-            
-            if H_rgb is None:
-                continue
-
-            src_thermal = cv2.imread(src_warped_path)
-
-            warped_src = cv2.warpPerspective(
-                src_thermal,
-                H_rgb,
-                (Wt, Ht)
-            )
-
-            src_mask = _mask_from_nonzero(warped_src)
-
-            if dcfg['mask_dilate_px'] > 0:
-                k = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE,
-                    (dcfg['mask_dilate_px'] * 2 + 1,
-                     dcfg['mask_dilate_px'] * 2 + 1)
-                )
-                src_mask = cv2.dilate(src_mask, k)
-
-            dst_mask = _mask_from_nonzero(mosaic)
-
-            fill_mask = cv2.bitwise_and(
-                src_mask,
-                cv2.bitwise_not(dst_mask)
-            )
-
-            mosaic = _feather_blend(
-                mosaic,
-                warped_src,
-                fill_mask,
-                dcfg['feather_px']
-            )
-
-        out_path = os.path.join(
-            out_dir,
-            vf.replace('.JPG', '_densified.png')
-        )
-
-        cv2.imwrite(out_path, mosaic)
-        print(f"  saved {out_path}")
-
 
 def main(cfg=CONFIG):
     if cfg.get("fresh_start"):
@@ -1529,14 +1097,14 @@ def main(cfg=CONFIG):
     if cfg["dry_run"]:
         return
 
-    print("\\n=== STEP 2a: calibrate (runs once, reused after) ===")
+    print("\n=== STEP 2a: calibrate (runs once, reused after) ===")
     M_work, work_size, tps, distortion = calibrate(cfg)
 
-    print("\\n=== STEP 2b: apply calibrated transform (color, no LoFTR) ===")
+    print("\n=== STEP 2b: apply calibrated transform (color, no LoFTR) ===")
     apply_calibration(cfg, M_work, work_size, tps, distortion)
 
-    print("\\n=== STEP 3: densify using ODM/OpenSfM matches ===")
-    densify_with_odm(cfg)
+    print("\nStep 2 done. Run step3_densify.py separately to densify using "
+          "neighboring visible-frame overlap (it only reads this script's outputs).")
 
 
 if __name__ == "__main__":
