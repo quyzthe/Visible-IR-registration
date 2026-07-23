@@ -58,6 +58,8 @@ import gzip
 import pickle
 import shutil
 import math
+import heapq
+import gc
 
 import cv2
 import torch
@@ -157,12 +159,19 @@ CONFIG = dict(
     max_pairs_per_run=1,          # None = process everything found; int = only this many NEW pairs this run
     skip_already_processed=True,   # skip pairs that already have an overlay output on disk
 
-    # ---- Step 3: densify -- fill gaps using overlap between NEIGHBORING visible
-    # frames (same-modality RGB-RGB matching, far more reliable than cross-modal).
-    # Reuses each neighbor's already-computed warped_thermal (Step 2b), projected
-    # into the target frame via the visible(neighbor)->visible(target) homography.
-    # Requires CONFIG['odm']['enabled']=True -- features and matches come ONLY
-    # from ODM's own opensfm/ outputs now, no self-computed SIFT/BoW/FLANN
+    # ---- Step 3 ("fill_dens"): densify -- fill gaps left by Step 2b (the
+    # "overlay" step) using overlap between NEIGHBORING visible frames
+    # (same-modality RGB-RGB matching, far more reliable than cross-modal).
+    # Images are processed in an INCREMENTAL BEST-FIRST order (see
+    # compute_fill_order), not index order, so that each target's neighbors
+    # are, whenever possible, already-filled themselves -- when a neighbor
+    # HAS already been filled, its own propagated fill_dens output
+    # (dense_thermal/) is used as the source; otherwise its raw single-pair
+    # overlay (warped_thermal/, Step 2b) is used, same as before. Either
+    # way it's projected into the target frame via the
+    # visible(neighbor)->visible(target) homography. Requires
+    # CONFIG['odm']['enabled']=True -- features and matches come ONLY from
+    # ODM's own opensfm/ outputs now, no self-computed SIFT/BoW/FLANN
     # fallback. An image ODM didn't reconstruct is simply excluded from this step.
     densify=dict(
         enabled=True,
@@ -198,7 +207,19 @@ CONFIG = dict(
                                       # a new source fills in -- reduces visible seams between sources
                                       # captured at different times/positions. 0 = hard cutoff, no blend.
 
-        max_pairs_per_run=100,       # separate cap -- this stage does its own feature matching too
+        max_pairs_per_run=1000,       # separate cap -- this stage does its own feature matching too.
+                                      # Also bounds peak memory: each image processed allocates several
+                                      # native-resolution buffers per track-reachable neighbor (own
+                                      # overlay + every neighbor's warp + the new dense_thermal sidecar --
+                                      # see densify_with_neighbors' Step 5), and on a large flight (1000+
+                                      # images, 100k+ tracks) the resident feats/tracks_by_image structures
+                                      # alone are already sizable. If you see 'Unable to allocate ... MiB'
+                                      # / OpenCV OutOfMemoryError partway through a run, this is almost
+                                      # always the fix: LOWER this (e.g. 20-50) and just call the script
+                                      # again -- everything here (dense_thermal/, overlays_dense/,
+                                      # tracks.csv, rgb_matches.csv, rgb_inlier_matches.csv, rgb_features/)
+                                      # is cached on disk, so several smaller runs reach the exact same
+                                      # end state as one huge one, each starting with a clean process.
         skip_already_processed=True,
     ),
 
@@ -1351,20 +1372,32 @@ def apply_calibration(cfg, M_work, work_size, tps=None, distortion=None):
     return run_now
 
 # =====================================================================
-# STEP 3: DENSIFY -- fill gaps using overlap between neighboring visible
-# frames, sourcing features/matches entirely from ODM (see CONFIG['odm']):
+# STEP 3 ("fill_dens"): DENSIFY -- fill gaps left by Step 2b (the "overlay"
+# step: direct, per-pair thermal<->visible registration, always using the
+# SAME fixed calibrated transform, so every image's own overlay covers the
+# same relative footprint and can never by itself cover the rest of the
+# frame). fill_dens closes that gap using visible-visible (RGB-RGB)
+# feature matching between NEIGHBORING frames -- same-modality matching is
+# far more reliable than cross-modal thermal<->visible matching -- sourced
+# entirely from ODM (see CONFIG['odm']):
 #   1) load ODM feature points (opensfm/features/*.npz), ONCE per image, cached
-#   2) candidate selection : directly from ODM's own matched-pair list
-#      (opensfm/matches/*.pkl.gz) -- it already tells us, per image, exactly
-#      which other images overlap, no retrieval step needed
-#   3) match verification   : ODM's matches are trusted directly as track
-#      correspondences by default (see CONFIG['odm']['verify_planar_homography'])
+#   2) candidate selection: directly from ODM's opensfm/matches/*.pkl.gz --
+#      see CONFIG['odm']
+#   2.5) processing order: incremental BEST-FIRST (compute_fill_order),
+#      not a fixed index order -- see that function's docstring. This is
+#      what lets step 5 below draw on an ALREADY-FILLED neighbor's
+#      propagated fill_dens output, not just its raw overlay.
+#   3) match verification: ODM's matches trusted directly, see CONFIG['odm']
 #   4) create_tracks     : Union-Find links verified matches across ALL
 #      pairs into tracks -- a track is one physical feature seen in N
 #      images, including images never directly matched to each other
-#   5) fill each target using every image reachable via a SHARED TRACK,
-#      fitting one direct homography per (source, target) from the pooled
-#      track correspondences, composited with soft feathering at the seams
+#   5) fill each target, in the order from 2.5, using every image reachable
+#      via a SHARED TRACK: fit one direct homography per (source, target)
+#      from the pooled track correspondences (as before), but now source
+#      each neighbor's PIXELS from its own already-propagated fill_dens
+#      output (dense_thermal/) when that neighbor has already been filled,
+#      falling back to its raw single-pair overlay (warped_thermal/)
+#      otherwise -- composited with soft feathering at the seams.
 # =====================================================================
 
 def _load_warped_thermal_bgra(path):
@@ -1379,6 +1412,29 @@ def _load_warped_thermal_bgra(path):
             "in BGRA (calibration.npz stays cached, so this is fast -- no LoFTR needed)."
         )
     return img[:, :, :3], img[:, :, 3]
+
+
+def _load_dense_thermal_bgra(path):
+    """Reader for register_results/dense_thermal/<idx>_T_dense.png -- the
+    propagation source Step 5 (fill_dens) writes for itself: pure
+    composited-thermal pixels (own overlay + whatever it pulled from
+    already-filled neighbors) + a coverage alpha mask, same BGRA shape as
+    warped_thermal/. This is what lets a LATER image in the fill order draw
+    on an EARLIER image's already-propagated coverage instead of just that
+    earlier image's raw single-pair overlay."""
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f"Could not read: {path}")
+    if img.ndim != 3 or img.shape[2] != 4:
+        raise ValueError(
+            f"{os.path.basename(path)} has no alpha channel (shape={img.shape}) -- it was written "
+            "by an older run of densify_with_neighbors() before dense_thermal/ existed. Delete "
+            "register_results/dense_thermal/ and register_results/overlays_dense/ and rerun Step 3 "
+            "(fill_dens) to regenerate them -- tracks.csv, rgb_features/, rgb_matches.csv and "
+            "rgb_inlier_matches.csv all stay cached, so this is fast (no re-matching needed)."
+        )
+    return img[:, :, :3], img[:, :, 3]
+
 
 class UnionFind:
     """Standard union-find with path compression, keyed on arbitrary
@@ -1586,6 +1642,99 @@ def _warp_alpha_smooth(alpha, H_full, out_size, keep_fraction=0.5):
     return (warped >= thresh).astype(np.uint8) * np.uint8(255)
 
 
+# =====================================================================
+# STEP 3, ORDERING: incremental best-first fill order (instead of a fixed
+# index order) -- the piece that makes fill_dens propagation possible.
+#
+# Same idea as incremental SfM's "next best image" selection (COLMAP:
+# always register next whichever unregistered image has the most matches
+# to the CURRENT model -- Schoenberger & Frahm, "Structure-from-Motion
+# Revisited", CVPR 2016) and classic panorama-graph stitching order (Brown
+# & Lowe, "Automatic Panoramic Image Stitching using Invariant Features",
+# IJCV 2007: images are added in decreasing pairwise match confidence, not
+# in whatever order they were shot). Applied here to Step 5 (fill_dens):
+# grow a frontier greedily from whatever's already filled (a past run's
+# `done`, or images filled earlier in THIS run), always advancing into
+# whichever pending image has the single strongest visible-visible edge
+# into that frontier.
+#
+# The point isn't just a nicer order -- it's what makes the fill/overlay
+# distinction in Step 5 possible: by construction, an image's strongest
+# neighbor is guaranteed to already be filled by the time that image gets
+# processed, so it can pull that neighbor's ALREADY-PROPAGATED coverage
+# (dense_thermal/, from fill_dens) instead of only that neighbor's raw
+# single-pair thermal footprint (warped_thermal/, from the overlay step).
+# That's what lets thermal coverage spread transitively across a whole
+# flight instead of stopping one hop away from each image's own direct
+# overlay.
+#
+# Caveat worth knowing (see e.g. "Uncertainty-aware Spatial-Frequency
+# Registration and Fusion for Infrared and Visible Images", 2026, on error
+# accumulation in multi-stage IR/visible fusion): pixels sourced through a
+# long propagation chain carry the registration error of every hop they
+# passed through, even though each individual hop here still fits its own
+# fresh, direct homography (never a chained/composed matrix). Step 5 always
+# composites the OWN direct overlay first and ranks neighbors by their own
+# pairwise match strength, so propagated (multi-hop) coverage only ever
+# fills whatever the strongest direct connections couldn't reach -- but it
+# is still lower-confidence than a direct overlay, worth keeping in mind
+# when reviewing coverage far from any image's own thermal footprint.
+# =====================================================================
+
+def compute_fill_order(pending_ids, seed_ids, candidates_by_idx, edge_weight):
+    """Returns [(idx, best_predecessor_idx_or_None, edge_weight), ...] in
+    the order Step 5 should process `pending_ids`.
+
+    `seed_ids` (already filled, e.g. from a past run) seed the frontier for
+    free. Any image with zero path to a seed (ODM sometimes reconstructs a
+    flight as several disconnected sub-models -- see
+    load_odm_reconstruction's warning) starts its own component from
+    whichever pending image has the highest total edge weight, the same
+    criterion COLMAP uses to pick its very first image pair.
+    """
+    pending = set(pending_ids)
+    visited = set(seed_ids)
+    order = []
+    frontier = []  # heap of (-weight, tie_breaker, idx, predecessor)
+    counter = 0
+
+    def push_from(node):
+        nonlocal counter
+        for nb in candidates_by_idx.get(node, []):
+            if nb in pending:
+                counter += 1
+                heapq.heappush(frontier, (-edge_weight.get((node, nb), 0), counter, nb, node))
+
+    for s in visited:
+        push_from(s)
+
+    while pending:
+        picked = None
+        while frontier:
+            negw, _, nb, src = heapq.heappop(frontier)
+            if nb in pending:
+                picked = (nb, src, -negw)
+                break
+        if picked is None:
+            # nothing reachable from what's visited -- new component, seed
+            # it the way COLMAP picks its initial pair: highest total weight
+            def total_weight(n):
+                return sum(edge_weight.get((n, m), 0) for m in candidates_by_idx.get(n, []))
+            seed = max(pending, key=total_weight)
+            order.append((seed, None, 0))
+            visited.add(seed)
+            pending.discard(seed)
+            push_from(seed)
+            continue
+        nb, src, w = picked
+        order.append((nb, src, w))
+        visited.add(nb)
+        pending.discard(nb)
+        push_from(nb)
+
+    return order
+
+
 def densify_with_neighbors(cfg):
     dz = cfg["densify"]
     if not dz["enabled"]:
@@ -1593,27 +1742,26 @@ def densify_with_neighbors(cfg):
 
     pairs = find_pairs(cfg["visible_dir"], cfg["thermal_dir"])
     by_idx = {idx: (v, t) for idx, v, t in pairs}
-    warped_dir = os.path.join(cfg["register_results_dir"], "warped_thermal")
-    dense_dir = os.path.join(cfg["register_results_dir"], "overlays_dense")
+    warped_dir = os.path.join(cfg["register_results_dir"], "warped_thermal")       # overlay step's raw per-pair output
+    dense_dir = os.path.join(cfg["register_results_dir"], "overlays_dense")        # fill_dens: flattened, human-viewable
+    dense_thermal_dir = os.path.join(cfg["register_results_dir"], "dense_thermal")  # fill_dens: BGRA propagation source
     os.makedirs(dense_dir, exist_ok=True)
+    os.makedirs(dense_thermal_dir, exist_ok=True)
 
     have_warped = {idx for idx in by_idx if os.path.exists(os.path.join(warped_dir, f"{idx}_T_warped.png"))}
     if not have_warped:
-        print("No warped_thermal outputs found yet -- run Step 2b (apply) first.")
+        print("No warped_thermal outputs found yet -- run Step 2b (apply/overlay) first.")
         return []
 
     if dz.get("skip_already_processed", True) and os.path.isdir(dense_dir):
         done = {fn[:-len("_overlay_dense.png")] for fn in os.listdir(dense_dir) if fn.endswith("_overlay_dense.png")}
-        pending = sorted((have_warped - done), key=int)
     else:
-        pending = sorted(have_warped, key=int)
+        done = set()
+    pending_all = have_warped - done
 
-    limit = dz.get("max_pairs_per_run")
-    run_now = pending[:limit] if limit is not None else pending
-    print(f"{len(have_warped)} candidates with warped thermal | {len(have_warped) - len(pending)} already "
-          f"densified | densifying {len(run_now)} this session"
-          + (f" | {len(pending) - len(run_now)} will remain for next run" if len(pending) > len(run_now) else ""))
-    if not run_now:
+    print(f"{len(have_warped)} candidates with warped thermal (overlay step) | {len(done)} already "
+          f"densified (fill_dens) | {len(pending_all)} pending")
+    if not pending_all:
         return []
 
     odm_cfg = cfg.get("odm") or {}
@@ -1660,11 +1808,41 @@ def densify_with_neighbors(cfg):
     for a, b in odm_pair_corr:
         candidates_by_idx.setdefault(a, []).append(b)
         candidates_by_idx.setdefault(b, []).append(a)
+    edge_weight = {}  # symmetric: (a,b) and (b,a) both -> match count, a cheap (pre-RANSAC) proxy
+    for (a, b), arr in odm_pair_corr.items():          # for match confidence, used only to pick fill order
+        edge_weight[(a, b)] = edge_weight[(b, a)] = len(arr)
 
     no_matches = set(feats) - odm_has_matches
     print(f"   {len(odm_pair_corr)} candidate pairs from ODM matches"
           + (f" | {len(no_matches)}/{len(feats)} image(s) have no ODM matches file -- excluded "
              "(no fallback)" if no_matches else ""))
+
+    # ---- 2.5) processing order: incremental best-first (see compute_fill_order's
+    # docstring) instead of a fixed index order -- decides which images this
+    # run actually fills (after max_pairs_per_run) AND the order it fills them
+    # in, which is what lets later images draw on earlier ones' propagated
+    # fill_dens coverage in Step 5 ----
+    print("2.5) ordering pending images best-first (incremental, COLMAP-style next-best-image)...")
+    orderable = pending_all & set(feats)
+    seed_ids = done & set(feats)
+    fill_order_full = compute_fill_order(orderable, seed_ids, candidates_by_idx, edge_weight)
+    no_feats_pending = pending_all - set(feats)
+    if no_feats_pending:
+        print(f"   {len(no_feats_pending)} pending image(s) have no ODM features -- excluded (no fallback)")
+
+    limit = dz.get("max_pairs_per_run")
+    run_now_order = fill_order_full[:limit] if limit is not None else fill_order_full
+    run_now = [idx for idx, _, _ in run_now_order]
+    remaining_after = len(fill_order_full) - len(run_now_order)
+    print(f"   filling {len(run_now)} this session"
+          + (f" | {remaining_after} will remain for next run" if remaining_after > 0 else ""))
+    if run_now_order:
+        preview = ", ".join(
+            f"{i}" + (f"<-{p}" if p is not None else "(seed)") for i, p, _ in run_now_order[:10]
+        )
+        print(f"   order: {preview}" + (", ..." if len(run_now_order) > 10 else ""))
+    if not run_now:
+        return []
 
     # ---- 3) match verification: ODM's matches are trusted directly as track
     # correspondences by default (no re-fit RANSAC -- see CONFIG['odm'] for
@@ -1757,10 +1935,27 @@ def densify_with_neighbors(cfg):
             return None, 0
         return H, int(mask.sum())
 
-    # ---- 5) fill each target from every track-reachable image ----
-    print("5) filling targets from every track-reachable image...")
+    # ---- 5) fill each target, in the incremental best-first order from Step
+    # 2.5, pulling each neighbor's RICHEST available source: its own already-
+    # propagated fill_dens output (dense_thermal/) if that neighbor has
+    # already been filled -- this run (earlier in run_now_order) or a past
+    # one (`done`) -- else its raw single-pair overlay (warped_thermal/), the
+    # same as before this change. `densified_now` starts at `done` and grows
+    # as we go, so propagation compounds across a single run too, not just
+    # across separate runs. ----
+    print("5) filling targets, best-first order (own overlay -> track-reachable neighbors, preferring "
+          "each neighbor's fill_dens propagation over its raw overlay once that neighbor is filled)...")
+    legacy_done_no_sidecar = {
+        i for i in done if not os.path.exists(os.path.join(dense_thermal_dir, f"{i}_T_dense.png"))
+    }
+    if legacy_done_no_sidecar:
+        print(f"   [NOTE] {len(legacy_done_no_sidecar)} already-densified image(s) predate dense_thermal/ "
+              "(written before this change) -- they'll only be usable as raw-overlay neighbors until "
+              "reprocessed. Delete their overlays_dense/<idx>_overlay_dense.png to force a refill.")
+    densified_now = done - legacy_done_no_sidecar
+
     n_ok, n_err = 0, 0
-    for idx in run_now:
+    for i_run, (idx, pred, pred_w) in enumerate(run_now_order):
         try:
             vpath, _ = by_idx[idx]
             visible_target = load_color(vpath)
@@ -1794,6 +1989,10 @@ def densify_with_neighbors(cfg):
                     if im != idx and im in have_warped:
                         reachable.add(im)
 
+            # ranked by this pair's OWN match strength (unchanged) -- which
+            # source file backs a given neighbor (fill_dens vs raw overlay)
+            # doesn't change how strongly ITS DIRECT geometric fit to idx is
+            # trusted, only how much of the frame it can contribute
             scored = []
             for nidx in reachable:
                 H, inl = homography_via_tracks(nidx, idx)
@@ -1801,8 +2000,13 @@ def densify_with_neighbors(cfg):
                     scored.append((nidx, H, inl))
             scored.sort(key=lambda t: -t[2])
 
+            n_from_dense, n_from_overlay = 0, 0
             for nidx, H_n_to_target, inl in scored:
-                n_bgr, n_alpha = _load_warped_thermal_bgra(os.path.join(warped_dir, f"{nidx}_T_warped.png"))
+                use_dense = nidx in densified_now
+                if use_dense:
+                    n_bgr, n_alpha = _load_dense_thermal_bgra(os.path.join(dense_thermal_dir, f"{nidx}_T_dense.png"))
+                else:
+                    n_bgr, n_alpha = _load_warped_thermal_bgra(os.path.join(warped_dir, f"{nidx}_T_warped.png"))
                 nvpath, _ = by_idx[nidx]
                 neighbor_shape = load_color(nvpath).shape
                 H_full = full_res_matrix(H_n_to_target, neighbor_shape, visible_target.shape, cfg["work_size"])
@@ -1818,17 +2022,49 @@ def densify_with_neighbors(cfg):
                     dense, filled, warped_bgr, warped_alpha, dz["feather_px"], dz["mask_dilate_px"]
                 )
                 n_sources += 1
+                n_from_dense += int(use_dense)
+                n_from_overlay += int(not use_dense)
+                print(f"    [{idx}] <- {nidx}: {inl} track corr., source="
+                      f"{'fill_dens (propagated)' if use_dense else 'raw overlay (direct)'}")
 
             final_coverage = float(filled.mean())
+
+            # dense_thermal/: pure composited-thermal pixels + coverage mask,
+            # BGRA -- the propagation source later targets read above (mirrors
+            # warped_thermal/'s role for the overlay step's raw output)
+            thermal_only = np.zeros_like(dense)
+            thermal_only[filled] = dense[filled]
+            alpha_out = filled.astype(np.uint8) * np.uint8(255)
+            cv2.imwrite(os.path.join(dense_thermal_dir, f"{idx}_T_dense.png"),
+                        np.dstack([thermal_only, alpha_out]))
+
+            # overlays_dense/: flattened, human-viewable composite (unchanged)
             cv2.imwrite(os.path.join(dense_dir, f"{idx}_overlay_dense.png"), dense)
-            print(f"[{idx}] {n_sources} source(s) (of {len(reachable)} track-reachable), "
-                  f"coverage {base_coverage:.1%} -> {final_coverage:.1%}")
+            densified_now.add(idx)
+
+            pred_note = f", best predecessor {pred} (w={pred_w})" if pred is not None else " (component seed)"
+            print(f"[{idx}] {n_sources} source(s): 1 own + {n_from_dense} fill_dens + {n_from_overlay} raw "
+                  f"overlay (of {len(reachable)} track-reachable), coverage {base_coverage:.1%} -> "
+                  f"{final_coverage:.1%}{pred_note}")
             n_ok += 1
         except Exception as e:
             n_err += 1
             print(f"[{idx}] ERROR: {e}")
+        finally:
+            # each iteration allocates several native-resolution (e.g.
+            # 4032x3024) buffers per neighbor -- CPython frees them via
+            # refcounting as soon as they go out of scope, but on long
+            # single-run batches (hundreds of images) the process's
+            # reported working set can still climb (allocator arenas not
+            # returned to the OS, or a still-live exception traceback
+            # pinning one iteration's arrays) until an allocation fails.
+            # This won't fix a machine that's genuinely out of RAM for the
+            # batch size requested -- see densify.max_pairs_per_run's
+            # comment -- but it's a cheap, harmless nudge for the rest.
+            if (i_run + 1) % 20 == 0:
+                gc.collect()
 
-    print(f"\nThis run: {n_ok} ok, {n_err} error, {len(run_now)} total")
+    print(f"\nThis run: {n_ok} ok, {n_err} error, {len(run_now_order)} total")
     return run_now
 
 
